@@ -41,6 +41,15 @@ static esp_io_expander_handle_t io_expander = NULL;
 static volatile bool power_dialog_open = false;
 static volatile bool battery_refresh_requested = false;
 
+/* Real AXP2101 charging-event state.
+ * The animation is triggered on a false -> true charging transition.
+ * If the user is on another page, the animation waits until FACE is visible.
+ */
+static volatile bool charging_animation_active = false;
+static volatile bool charging_animation_pending = false;
+
+static void play_charging_animation_once(void);
+
 /* =========================================================
  * Page navigation
  *
@@ -183,13 +192,57 @@ static void battery_status_task(void *arg)
 {
     (void)arg;
 
+    bool charging_state_known = false;
+    bool was_charging = false;
+
     while (1)
     {
+        pmu_battery_status_t status = {0};
+        bool valid = (pmu_bridge_get_battery_status(&status) == 0);
+
+        /*
+         * Always poll the AXP2101, even while the Face page is visible.
+         * This is what lets KOYODA notice a cable/charge event after boot.
+         */
+        if (valid)
+        {
+            bool charging_now = status.battery_connected && status.charging;
+
+            if (!charging_state_known)
+            {
+                charging_state_known = true;
+                was_charging = charging_now;
+
+                /* Booted while already charging: play once. */
+                if (charging_now)
+                {
+                    charging_animation_pending = true;
+                    ESP_LOGI(TAG, "Charging detected at boot");
+                }
+            }
+            else
+            {
+                /* Real charging edge while KOYODA is already running. */
+                if (charging_now && !was_charging)
+                {
+                    charging_animation_pending = true;
+                    ESP_LOGI(TAG, "Charging started");
+                }
+                else if (!charging_now && was_charging)
+                {
+                    ESP_LOGI(TAG, "Charging stopped");
+                }
+
+                was_charging = charging_now;
+            }
+        }
+
+        /*
+         * Battery UI only needs repainting when visible (or explicitly
+         * requested), but charge detection above keeps running everywhere.
+         */
         if (current_page == PAGE_BATTERY || battery_refresh_requested)
         {
-            pmu_battery_status_t status = {0};
-            bool valid = (pmu_bridge_get_battery_status(&status) == 0);
-
             bsp_display_lock(-1);
             update_battery_ui_locked(&status, valid);
             bsp_display_unlock();
@@ -209,7 +262,20 @@ static void battery_status_task(void *arg)
             battery_refresh_requested = false;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        /*
+         * Do not steal the Battery page from the user.  If charging starts
+         * there, remember the event and play it once when FACE is visible.
+         */
+        if (charging_animation_pending &&
+            current_page == PAGE_FACE &&
+            !power_dialog_open &&
+            !charging_animation_active)
+        {
+            charging_animation_pending = false;
+            play_charging_animation_once();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
@@ -617,6 +683,19 @@ static void power_button_task(void *arg)
 
 static void play_charging_animation_once(void)
 {
+    /*
+     * Charging may start while Battery/Future page is open.
+     * Keep the event pending instead of forcing page navigation.
+     */
+    if (current_page != PAGE_FACE)
+    {
+        charging_animation_pending = true;
+        return;
+    }
+
+    charging_animation_active = true;
+    ESP_LOGI(TAG, "Playing real charging animation");
+
     const lv_image_dsc_t *frames[] = {
         &koyoda_charge_1,
         &koyoda_charge_2,
@@ -637,17 +716,33 @@ static void play_charging_animation_once(void)
             vTaskDelay(pdMS_TO_TICKS(50));
         }
 
+        if (current_page != PAGE_FACE)
+        {
+            /* User swiped away during the animation: replay once on return. */
+            charging_animation_pending = true;
+            break;
+        }
+
         show_face(frames[i]);
         vTaskDelay(pdMS_TO_TICKS(delays_ms[i]));
     }
 
-    show_face(&koyoda_idle);
+    if (current_page == PAGE_FACE && !power_dialog_open)
+    {
+        show_face(&koyoda_idle);
+    }
+
+    charging_animation_active = false;
     ESP_LOGI(TAG, "Charging animation finished, back to idle");
 }
 
 static void idle_blink_step(void)
 {
-    if (power_dialog_open)
+    /*
+     * Blink and charging animation share the same face image.
+     * Never let the blink task overwrite a charging frame.
+     */
+    if (power_dialog_open || charging_animation_active)
     {
         vTaskDelay(pdMS_TO_TICKS(50));
         return;
@@ -656,19 +751,19 @@ static void idle_blink_step(void)
     show_face(&koyoda_idle);
     vTaskDelay(pdMS_TO_TICKS(3000));
 
-    if (power_dialog_open) return;
+    if (power_dialog_open || charging_animation_active) return;
     show_face(&koyoda_half);
     vTaskDelay(pdMS_TO_TICKS(60));
 
-    if (power_dialog_open) return;
+    if (power_dialog_open || charging_animation_active) return;
     show_face(&koyoda_closed);
     vTaskDelay(pdMS_TO_TICKS(90));
 
-    if (power_dialog_open) return;
+    if (power_dialog_open || charging_animation_active) return;
     show_face(&koyoda_half);
     vTaskDelay(pdMS_TO_TICKS(60));
 
-    if (power_dialog_open) return;
+    if (power_dialog_open || charging_animation_active) return;
     show_face(&koyoda_idle);
 }
 
@@ -712,7 +807,7 @@ void app_main(void)
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
 
     face_img = lv_image_create(screen);
-    lv_image_set_src(face_img, &koyoda_charge_1);
+    lv_image_set_src(face_img, &koyoda_idle);
     lv_image_set_pivot(face_img, 233, 233);
     lv_image_set_rotation(face_img, 900);
     lv_obj_center(face_img);
@@ -740,8 +835,11 @@ void app_main(void)
         4,
         NULL);
 
-    play_charging_animation_once();
-
+    /*
+     * No fake boot animation here.
+     * battery_status_task will play charging animation only when
+     * AXP2101 reports a real charging state.
+     */
     while (1)
     {
         idle_blink_step();
