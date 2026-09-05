@@ -4,6 +4,12 @@ idf_component_register(
          "koyoda_idle.c"
          "koyoda_half.c"
          "koyoda_closed.c"
+         "koyoda_charge_1.c"
+         "koyoda_charge_2.c"
+         "koyoda_charge_3.c"
+         "koyoda_charge_4.c"
+         "koyoda_charge_5.c"
+         "koyoda_charge_6.c"
     INCLUDE_DIRS "."
     REQUIRES XPowersLib
 )
