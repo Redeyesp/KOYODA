@@ -10,6 +10,9 @@ idf_component_register(
          "koyoda_charge_4.c"
          "koyoda_charge_5.c"
          "koyoda_charge_6.c"
+         "koyoda_sleep_1.c"
+         "koyoda_sleep_2.c"
+         "koyoda_sleep_3.c"
     INCLUDE_DIRS "."
     REQUIRES XPowersLib
 )
