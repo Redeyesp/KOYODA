@@ -1,4 +1,4 @@
-name: KOYODA baseline 4ad3fde
+name: KOYODA baseline 4ad3fde - 6MiB app fix
 
 on:
   workflow_dispatch:
@@ -32,6 +32,32 @@ jobs:
           test -f dependencies.lock
           grep -qx 'CONFIG_IDF_TARGET="esp32s3"' sdkconfig
           git ls-files -z main assets | xargs -0 sha256sum > baseline-assets.sha256
+
+      - name: Expand factory partition to fit baseline firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv
+          from pathlib import Path
+          p = Path('partitions.csv')
+          original = p.read_text()
+          rows = [[v.strip() for v in row] for row in csv.reader(
+              line for line in original.splitlines() if line.strip() and not line.lstrip().startswith('#'))]
+          expected = [
+              ['nvs', 'data', 'nvs', '0x9000', '0x6000', ''],
+              ['phy_init', 'data', 'phy', '0xf000', '0x1000', ''],
+              ['factory', 'app', 'factory', '0x10000', '4M', ''],
+          ]
+          if rows != expected:
+              raise SystemExit('Unexpected partition layout; refusing to modify it.')
+          assert 0x453230 < 6 * 1024 * 1024
+          assert 0x10000 + 6 * 1024 * 1024 <= 16 * 1024 * 1024
+          Path('partitions-baseline.csv').write_text(original)
+          p.write_text(original.replace('4M', '6M', 1))
+          print(p.read_text())
+          PY
+          git diff -- partitions.csv > partition-fix.patch
 
       - name: Build with ESP-IDF 5.5.4 on Linux
         shell: bash
@@ -73,11 +99,12 @@ jobs:
               shutil.copy2(source, dest)
           for name in ('flash_args', 'flasher_args.json'):
               shutil.copy2(build / name, out / name)
-          for name in ('sdkconfig', 'dependencies.lock', 'partitions.csv', 'baseline-assets.sha256'):
+          for name in ('sdkconfig', 'dependencies.lock', 'partitions.csv', 'partitions-baseline.csv', 'partition-fix.patch', 'baseline-assets.sha256'):
               shutil.copy2(name, out / name)
           (out / 'BUILD-INFO.txt').write_text(
               f"KOYODA baseline: {os.environ['BASELINE_SHA']}\n"
               'ESP-IDF: v5.5.4\nTarget: esp32s3\n'
+              'Build adjustment: factory partition expanded from 4MiB to 6MiB at offset 0x10000.\n'
               'Source face assets verified unchanged. Hardware verification pending.\n'
           )
           (out / 'FLASH-WINDOWS.txt').write_text(
@@ -100,7 +127,7 @@ jobs:
       - name: Upload firmware for Windows flashing
         uses: actions/upload-artifact@v4
         with:
-          name: KOYODA-baseline-4ad3fde-IDF-5.5.4
+          name: KOYODA-baseline-4ad3fde-6MiB-IDF-5.5.4
           path: firmware/
           if-no-files-found: error
           retention-days: 14
