@@ -15,6 +15,7 @@ static const char *TAG = "PMU_BRIDGE";
 
 static XPowersPMU PMU;
 static i2c_master_dev_handle_t pmu_dev_handle = NULL;
+static bool pmu_initialized = false;
 
 
 static int pmu_register_read(
@@ -84,6 +85,11 @@ static int pmu_register_write_byte(
 
 extern "C" int pmu_bridge_init(void)
 {
+    if (pmu_initialized)
+    {
+        return 0;
+    }
+
     ESP_LOGI(TAG, "Initializing AXP2101");
 
     i2c_master_bus_handle_t bus =
@@ -141,6 +147,11 @@ extern "C" int pmu_bridge_init(void)
         return -1;
     }
 
+    /* Battery status page needs these measurements enabled. */
+    PMU.enableBattDetection();
+    PMU.enableBattVoltageMeasure();
+
+    pmu_initialized = true;
 
     ESP_LOGI(
         TAG,
@@ -153,10 +164,42 @@ extern "C" int pmu_bridge_init(void)
 
 extern "C" void pmu_bridge_shutdown(void)
 {
+    if (!pmu_initialized)
+    {
+        ESP_LOGW(TAG, "Shutdown requested before PMU initialization");
+        return;
+    }
+
     ESP_LOGI(
         TAG,
         "AXP2101 shutdown requested"
     );
 
     PMU.shutdown();
+}
+
+
+extern "C" int pmu_bridge_get_battery_status(pmu_battery_status_t *status)
+{
+    if (!pmu_initialized || status == NULL)
+    {
+        return -1;
+    }
+
+    status->battery_connected = PMU.isBatteryConnect();
+    status->vbus_in = PMU.isVbusIn();
+    status->charging = PMU.isCharging();
+
+    if (status->battery_connected)
+    {
+        status->battery_percent = PMU.getBatteryPercent();
+        status->battery_voltage_mv = PMU.getBattVoltage();
+    }
+    else
+    {
+        status->battery_percent = -1;
+        status->battery_voltage_mv = 0;
+    }
+
+    return 0;
 }
