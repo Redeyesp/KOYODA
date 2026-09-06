@@ -15,7 +15,6 @@
 
 #include "pmu_bridge.h"
 #include "koyoda_animation.h"
-#include "koyoda_motion_inline.h"
 
 LV_IMAGE_DECLARE(koyoda_idle);
 LV_IMAGE_DECLARE(koyoda_half);
@@ -693,56 +692,13 @@ static void face_animation_step(void)
         &koyoda_charge_1, &koyoda_charge_2, &koyoda_charge_3,
         &koyoda_charge_4, &koyoda_charge_5, &koyoda_charge_6
     };
-
-    static bool motion_was_active = false;
-
     bsp_display_lock(-1);
-
-    bool motion_active =
-        koyoda_motion_is_active() &&
-        current_page == PAGE_FACE &&
-        !power_dialog_open;
-
-    if (motion_active)
-    {
-        /*
-         * Physical movement wakes KOYODA from drowsy/sleep once.
-         * The normal animation engine is paused while the gyro expression
-         * owns face_img, so there is no second task/timer fighting LVGL.
-         */
-        if (!motion_was_active)
-        {
-            anim_touch(&animation, lv_tick_get());
-        }
-
-        const lv_image_dsc_t *motion_frame = koyoda_motion_current_image();
-
-        if (motion_frame != NULL &&
-            lv_image_get_src(face_img) != motion_frame)
-        {
-            lv_image_set_src(face_img, motion_frame);
-        }
+    unsigned frame = anim_tick(&animation, lv_tick_get(), current_page == PAGE_FACE,
+                              power_dialog_open, touch_held, &charging_animation_pending);
+    if (current_page == PAGE_FACE && !power_dialog_open &&
+        lv_image_get_src(face_img) != frames[frame]) {
+        lv_image_set_src(face_img, frames[frame]);
     }
-    else
-    {
-        unsigned frame = anim_tick(
-            &animation,
-            lv_tick_get(),
-            current_page == PAGE_FACE,
-            power_dialog_open,
-            touch_held,
-            &charging_animation_pending);
-
-        if (current_page == PAGE_FACE &&
-            !power_dialog_open &&
-            lv_image_get_src(face_img) != frames[frame])
-        {
-            lv_image_set_src(face_img, frames[frame]);
-        }
-    }
-
-    motion_was_active = motion_active;
-
     bsp_display_unlock();
     vTaskDelay(pdMS_TO_TICKS(20));
 }
@@ -798,21 +754,6 @@ void app_main(void)
 
     bsp_display_unlock();
 
-    /*
-     * QMI8658 initialization only.
-     * No constructor, no extra FreeRTOS task, no LVGL timer.
-     * Sensor polling happens later from app_main's existing loop.
-     */
-    esp_err_t motion_err = koyoda_motion_init();
-
-    if (motion_err != ESP_OK)
-    {
-        ESP_LOGE(
-            TAG,
-            "Motion init failed: %s; continuing without gyro reactions",
-            esp_err_to_name(motion_err));
-    }
-
     ESP_LOGI(TAG, "KOYODA UI ready: Face <-> Battery; future page slot reserved");
 
     xTaskCreate(
@@ -838,13 +779,6 @@ void app_main(void)
      */
     while (1)
     {
-        /*
-         * QMI8658 is read here in the existing app_main loop.
-         * koyoda_motion_poll() does NOT touch LVGL and does NOT take
-         * the display lock. face_animation_step() remains the sole
-         * owner of face_img.
-         */
-        koyoda_motion_poll();
         face_animation_step();
     }
 }

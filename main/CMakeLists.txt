@@ -13,15 +13,6 @@ idf_component_register(
          "koyoda_sleep_1.c"
          "koyoda_sleep_2.c"
          "koyoda_sleep_3.c"
-         "koyoda_motion_inline.c"
-         "fun_excited.c"
-         "fun_tilt.c"
-         "fun_drop.c"
-         "fun_peak_thrill.c"
-         "fun_dizzy.c"
-         "fun_happy.c"
     INCLUDE_DIRS "."
-    REQUIRES
-         XPowersLib
-         waveshare__qmi8658
+    REQUIRES XPowersLib
 )
