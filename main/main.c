@@ -344,23 +344,58 @@ static void set_page_from_lvgl(koyoda_page_t page)
     }
 
     current_page = page;
-    if (animation.mode == ANIM_CHARGE) charging_animation_pending = true;
+
+    if (animation.mode == ANIM_CHARGE)
+    {
+        charging_animation_pending = true;
+    }
+
     anim_reset(&animation, lv_tick_get());
 
     if (page == PAGE_FACE)
     {
+        /*
+         * Hard page separation:
+         * battery must be completely hidden before face is shown.
+         */
         lv_obj_add_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_opa(battery_page, LV_OPA_TRANSP, 0);
+
         lv_obj_clear_flag(face_img, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_opa(face_img, LV_OPA_COVER, 0);
         lv_image_set_src(face_img, &koyoda_idle);
+
+        /*
+         * Keep the visible page above the hidden page,
+         * then keep the transparent swipe layer on top for touch.
+         */
+        lv_obj_move_foreground(face_img);
+        lv_obj_move_foreground(swipe_layer);
+
         ESP_LOGI(TAG, "Page -> FACE");
     }
     else if (page == PAGE_BATTERY)
     {
+        /*
+         * The symptom we saw was battery labels drawn over a frozen face.
+         * Hide the face both by flag AND opacity so the two pages can never mix.
+         */
         lv_obj_add_flag(face_img, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_opa(face_img, LV_OPA_TRANSP, 0);
+
         lv_obj_clear_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_opa(battery_page, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_opa(battery_page, LV_OPA_COVER, 0);
+
+        lv_obj_move_foreground(battery_page);
+        lv_obj_move_foreground(swipe_layer);
+
         battery_refresh_requested = true;
+
         ESP_LOGI(TAG, "Page -> BATTERY");
     }
+
+    lv_obj_invalidate(lv_screen_active());
 }
 
 static void navigate_next_from_lvgl(void)
@@ -754,6 +789,19 @@ void app_main(void)
     create_battery_page(screen);
     create_swipe_layer(screen);
     anim_reset(&animation, lv_tick_get());
+
+    /*
+     * Always boot into a clean FACE page.
+     * This also establishes deterministic LVGL z-order:
+     * visible page -> transparent swipe layer.
+     */
+    current_page = PAGE_FACE;
+    lv_obj_add_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_opa(battery_page, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(face_img, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_opa(face_img, LV_OPA_COVER, 0);
+    lv_obj_move_foreground(face_img);
+    lv_obj_move_foreground(swipe_layer);
 
     bsp_display_unlock();
 
