@@ -15,7 +15,6 @@
 
 #include "pmu_bridge.h"
 #include "koyoda_animation.h"
-#include "koyoda_wifi.h"
 
 LV_IMAGE_DECLARE(koyoda_idle);
 LV_IMAGE_DECLARE(koyoda_half);
@@ -452,15 +451,15 @@ static void swipe_event_cb(lv_event_t *e)
        Physical RIGHT -> positive dominant delta -> previous page
      */
     int dominant_delta = (abs_dy >= abs_dx) ? dy : dx;
-    (void)dominant_delta;
 
-    /*
-     * Wi-Fi diagnostic mode:
-     * keep touch/tap wake, but temporarily disable page navigation.
-     * This proves whether the mixed Battery/Face screen is being caused
-     * by an unintended page switch rather than by Wi-Fi itself.
-     */
-    ESP_LOGI(TAG, "Swipe ignored in Wi-Fi face-only diagnostic mode");
+    if (dominant_delta < 0)
+    {
+        navigate_next_from_lvgl();
+    }
+    else
+    {
+        navigate_previous_from_lvgl();
+    }
 }
 
 static void create_swipe_layer(lv_obj_t *screen)
@@ -696,22 +695,7 @@ static void face_animation_step(void)
         &fun_happy
     };
     bsp_display_lock(-1);
-
-    /*
-     * Diagnostic safety net: battery page cannot appear in this build.
-     * Tap-to-wake still works because the transparent touch layer remains.
-     */
-    current_page = PAGE_FACE;
-    if (battery_page != NULL)
-    {
-        lv_obj_add_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (face_img != NULL)
-    {
-        lv_obj_clear_flag(face_img, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    unsigned frame = anim_tick(&animation, lv_tick_get(), true,
+    unsigned frame = anim_tick(&animation, lv_tick_get(), current_page == PAGE_FACE,
                               power_dialog_open, touch_held, &charging_animation_pending);
     if (current_page == PAGE_FACE && !power_dialog_open &&
         lv_image_get_src(face_img) != frames[frame]) {
@@ -770,33 +754,9 @@ void app_main(void)
     create_swipe_layer(screen);
     anim_reset(&animation, lv_tick_get());
 
-    /*
-     * Diagnostic checkpoint: hard-force Face as the only visible page.
-     */
-    current_page = PAGE_FACE;
-    lv_obj_add_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(face_img, LV_OBJ_FLAG_HIDDEN);
-    lv_image_set_src(face_img, &koyoda_idle);
-
     bsp_display_unlock();
 
-    ESP_LOGI(TAG, "WIFI_FACE_ONLY_DIAGNOSTIC v1");
-
     ESP_LOGI(TAG, "KOYODA UI ready: Face <-> Battery; future page slot reserved");
-
-    /*
-     * Start Wi-Fi only after the KOYODA UI is visible.
-     * Network failure must never block the pet UI.
-     */
-    esp_err_t wifi_err = koyoda_wifi_start();
-
-    if (wifi_err != ESP_OK)
-    {
-        ESP_LOGE(
-            TAG,
-            "Wi-Fi start failed: %s; KOYODA continues offline",
-            esp_err_to_name(wifi_err));
-    }
 
     xTaskCreate(
         power_button_task,
