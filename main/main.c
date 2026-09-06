@@ -28,6 +28,7 @@ LV_IMAGE_DECLARE(koyoda_charge_6);
 LV_IMAGE_DECLARE(koyoda_sleep_1);
 LV_IMAGE_DECLARE(koyoda_sleep_2);
 LV_IMAGE_DECLARE(koyoda_sleep_3);
+LV_IMAGE_DECLARE(fun_happy);
 
 static const char *TAG = "KOYODA";
 
@@ -402,8 +403,8 @@ static void swipe_event_cb(lv_event_t *e)
         touch_held = true;
         bool woke = anim_touch(&animation, lv_tick_get());
         if (woke) {
-            lv_image_set_src(face_img, &koyoda_idle);
             swipe_tracking = false;
+            ESP_LOGI(TAG, "Wake transition started");
             return; /* First touch wakes; it never also navigates. */
         }
         lv_indev_get_point(indev, &swipe_start);
@@ -690,7 +691,8 @@ static void face_animation_step(void)
         &koyoda_idle, &koyoda_half, &koyoda_closed,
         &koyoda_sleep_1, &koyoda_sleep_2, &koyoda_sleep_3,
         &koyoda_charge_1, &koyoda_charge_2, &koyoda_charge_3,
-        &koyoda_charge_4, &koyoda_charge_5, &koyoda_charge_6
+        &koyoda_charge_4, &koyoda_charge_5, &koyoda_charge_6,
+        &fun_happy
     };
     bsp_display_lock(-1);
     unsigned frame = anim_tick(&animation, lv_tick_get(), current_page == PAGE_FACE,
