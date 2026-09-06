@@ -15,6 +15,7 @@
 
 #include "pmu_bridge.h"
 #include "koyoda_animation.h"
+#include "koyoda_wifi.h"
 
 LV_IMAGE_DECLARE(koyoda_idle);
 LV_IMAGE_DECLARE(koyoda_half);
@@ -757,6 +758,20 @@ void app_main(void)
     bsp_display_unlock();
 
     ESP_LOGI(TAG, "KOYODA UI ready: Face <-> Battery; future page slot reserved");
+
+    /*
+     * Wi-Fi Clean Step 1:
+     * start only after the known-good KOYODA UI is already visible.
+     * The Wi-Fi module never touches LVGL, face_img, Battery UI, or page state.
+     */
+    esp_err_t wifi_err = koyoda_wifi_start();
+    if (wifi_err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Wi-Fi start failed: %s; KOYODA continues offline",
+            esp_err_to_name(wifi_err));
+    }
 
     xTaskCreate(
         power_button_task,
