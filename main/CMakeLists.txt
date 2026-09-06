@@ -14,5 +14,7 @@ idf_component_register(
          "koyoda_sleep_2.c"
          "koyoda_sleep_3.c"
     INCLUDE_DIRS "."
-    REQUIRES XPowersLib
+    REQUIRES
+         XPowersLib
+         koyoda_motion_probe
 )
