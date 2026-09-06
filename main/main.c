@@ -344,58 +344,23 @@ static void set_page_from_lvgl(koyoda_page_t page)
     }
 
     current_page = page;
-
-    if (animation.mode == ANIM_CHARGE)
-    {
-        charging_animation_pending = true;
-    }
-
+    if (animation.mode == ANIM_CHARGE) charging_animation_pending = true;
     anim_reset(&animation, lv_tick_get());
 
     if (page == PAGE_FACE)
     {
-        /*
-         * Hard page separation:
-         * battery must be completely hidden before face is shown.
-         */
         lv_obj_add_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_style_opa(battery_page, LV_OPA_TRANSP, 0);
-
         lv_obj_clear_flag(face_img, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_style_opa(face_img, LV_OPA_COVER, 0);
         lv_image_set_src(face_img, &koyoda_idle);
-
-        /*
-         * Keep the visible page above the hidden page,
-         * then keep the transparent swipe layer on top for touch.
-         */
-        lv_obj_move_foreground(face_img);
-        lv_obj_move_foreground(swipe_layer);
-
         ESP_LOGI(TAG, "Page -> FACE");
     }
     else if (page == PAGE_BATTERY)
     {
-        /*
-         * The symptom we saw was battery labels drawn over a frozen face.
-         * Hide the face both by flag AND opacity so the two pages can never mix.
-         */
         lv_obj_add_flag(face_img, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_style_opa(face_img, LV_OPA_TRANSP, 0);
-
         lv_obj_clear_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_style_opa(battery_page, LV_OPA_COVER, 0);
-        lv_obj_set_style_bg_opa(battery_page, LV_OPA_COVER, 0);
-
-        lv_obj_move_foreground(battery_page);
-        lv_obj_move_foreground(swipe_layer);
-
         battery_refresh_requested = true;
-
         ESP_LOGI(TAG, "Page -> BATTERY");
     }
-
-    lv_obj_invalidate(lv_screen_active());
 }
 
 static void navigate_next_from_lvgl(void)
@@ -487,15 +452,15 @@ static void swipe_event_cb(lv_event_t *e)
        Physical RIGHT -> positive dominant delta -> previous page
      */
     int dominant_delta = (abs_dy >= abs_dx) ? dy : dx;
+    (void)dominant_delta;
 
-    if (dominant_delta < 0)
-    {
-        navigate_next_from_lvgl();
-    }
-    else
-    {
-        navigate_previous_from_lvgl();
-    }
+    /*
+     * Wi-Fi diagnostic mode:
+     * keep touch/tap wake, but temporarily disable page navigation.
+     * This proves whether the mixed Battery/Face screen is being caused
+     * by an unintended page switch rather than by Wi-Fi itself.
+     */
+    ESP_LOGI(TAG, "Swipe ignored in Wi-Fi face-only diagnostic mode");
 }
 
 static void create_swipe_layer(lv_obj_t *screen)
@@ -731,7 +696,22 @@ static void face_animation_step(void)
         &fun_happy
     };
     bsp_display_lock(-1);
-    unsigned frame = anim_tick(&animation, lv_tick_get(), current_page == PAGE_FACE,
+
+    /*
+     * Diagnostic safety net: battery page cannot appear in this build.
+     * Tap-to-wake still works because the transparent touch layer remains.
+     */
+    current_page = PAGE_FACE;
+    if (battery_page != NULL)
+    {
+        lv_obj_add_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (face_img != NULL)
+    {
+        lv_obj_clear_flag(face_img, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    unsigned frame = anim_tick(&animation, lv_tick_get(), true,
                               power_dialog_open, touch_held, &charging_animation_pending);
     if (current_page == PAGE_FACE && !power_dialog_open &&
         lv_image_get_src(face_img) != frames[frame]) {
@@ -791,19 +771,16 @@ void app_main(void)
     anim_reset(&animation, lv_tick_get());
 
     /*
-     * Always boot into a clean FACE page.
-     * This also establishes deterministic LVGL z-order:
-     * visible page -> transparent swipe layer.
+     * Diagnostic checkpoint: hard-force Face as the only visible page.
      */
     current_page = PAGE_FACE;
     lv_obj_add_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_style_opa(battery_page, LV_OPA_TRANSP, 0);
     lv_obj_clear_flag(face_img, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_style_opa(face_img, LV_OPA_COVER, 0);
-    lv_obj_move_foreground(face_img);
-    lv_obj_move_foreground(swipe_layer);
+    lv_image_set_src(face_img, &koyoda_idle);
 
     bsp_display_unlock();
+
+    ESP_LOGI(TAG, "WIFI_FACE_ONLY_DIAGNOSTIC v1");
 
     ESP_LOGI(TAG, "KOYODA UI ready: Face <-> Battery; future page slot reserved");
 
