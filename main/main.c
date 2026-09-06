@@ -187,48 +187,86 @@ static void battery_status_task(void *arg)
 {
     (void)arg;
 
-    bool charging_state_known = false;
-    bool was_charging = false;
+    /*
+     * Wi-Fi can make the PMIC charging bit chatter briefly because power draw
+     * changes when the radio starts.  Do NOT use status.charging as the event
+     * source anymore.
+     *
+     * Instead, detect a real USB/VBUS insertion with a 3-sample debounce.
+     * At 500 ms polling this means VBUS must be stable for about 1.5 seconds
+     * before KOYODA queues the charging animation.
+     */
+    bool vbus_state_known = false;
+    bool stable_vbus = false;
+    bool candidate_vbus = false;
+    unsigned candidate_count = 0;
 
     while (1)
     {
         pmu_battery_status_t status = {0};
         bool valid = (pmu_bridge_get_battery_status(&status) == 0);
 
-        /*
-         * Always poll the AXP2101, even while the Face page is visible.
-         * This is what lets KOYODA notice a cable/charge event after boot.
-         */
         if (valid)
         {
-            bool charging_now = status.battery_connected && status.charging;
+            bool vbus_now = status.vbus_in;
 
-            if (!charging_state_known)
+            if (!vbus_state_known)
             {
-                charging_state_known = true;
-                was_charging = charging_now;
-
-                /* Booted while already charging: play once. */
-                if (charging_now)
+                if (candidate_count == 0 || candidate_vbus != vbus_now)
                 {
-                    request_charging_animation();
-                    ESP_LOGI(TAG, "Charging detected at boot");
+                    candidate_vbus = vbus_now;
+                    candidate_count = 1;
+                }
+                else
+                {
+                    candidate_count++;
+                }
+
+                if (candidate_count >= 3)
+                {
+                    vbus_state_known = true;
+                    stable_vbus = candidate_vbus;
+                    candidate_count = 0;
+
+                    /* Booted with USB/VBUS already present: play once only. */
+                    if (stable_vbus)
+                    {
+                        request_charging_animation();
+                        ESP_LOGI(TAG, "Stable VBUS detected at boot");
+                    }
+                }
+            }
+            else if (vbus_now != stable_vbus)
+            {
+                if (candidate_count == 0 || candidate_vbus != vbus_now)
+                {
+                    candidate_vbus = vbus_now;
+                    candidate_count = 1;
+                }
+                else
+                {
+                    candidate_count++;
+                }
+
+                if (candidate_count >= 3)
+                {
+                    stable_vbus = candidate_vbus;
+                    candidate_count = 0;
+
+                    if (stable_vbus)
+                    {
+                        request_charging_animation();
+                        ESP_LOGI(TAG, "Stable VBUS inserted");
+                    }
+                    else
+                    {
+                        ESP_LOGI(TAG, "Stable VBUS removed");
+                    }
                 }
             }
             else
             {
-                /* Real charging edge while KOYODA is already running. */
-                if (charging_now && !was_charging)
-                {
-                    request_charging_animation();
-                    ESP_LOGI(TAG, "Charging started");
-                }
-                else if (!charging_now && was_charging)
-                {
-                    ESP_LOGI(TAG, "Charging stopped");
-                }
-
-                was_charging = charging_now;
+                candidate_count = 0;
             }
         }
 
