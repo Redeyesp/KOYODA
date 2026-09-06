@@ -81,7 +81,7 @@ jobs:
               raise SystemExit("Unexpected factory partition.")
 
           size = rows[2][4]
-          if size not in ("4M", "6M", "8M"):
+          if size not in ("4M", "6M", "8M", "12M"):
               raise SystemExit(f"Unexpected factory partition size: {size}")
 
           Path("partitions-baseline.csv").write_text(original)
