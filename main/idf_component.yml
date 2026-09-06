@@ -4,3 +4,5 @@ dependencies:
   lvgl/lvgl:
     version: "9.4.*"
     public: true
+  waveshare/qmi8658:
+    version: "^2.0.0"
