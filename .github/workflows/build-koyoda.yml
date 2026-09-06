@@ -52,6 +52,41 @@ jobs:
 
           git ls-files -z main assets | xargs -0 sha256sum > source-assets.sha256
 
+
+      - name: Create private Wi-Fi build header
+        shell: bash
+        env:
+          KOYODA_WIFI_SSID: ${{ secrets.KOYODA_WIFI_SSID }}
+          KOYODA_WIFI_PASSWORD: ${{ secrets.KOYODA_WIFI_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${KOYODA_WIFI_SSID:-}" ]; then
+            echo "::error::KOYODA_WIFI_SSID repository secret is missing or empty."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          ssid = os.environ["KOYODA_WIFI_SSID"]
+          password = os.environ.get("KOYODA_WIFI_PASSWORD", "")
+
+          Path("main/koyoda_wifi_secrets.h").write_text(
+              "#pragma once\n"
+              f"#define KOYODA_WIFI_SSID {json.dumps(ssid, ensure_ascii=False)}\n"
+              f"#define KOYODA_WIFI_PASSWORD {json.dumps(password, ensure_ascii=False)}\n",
+              encoding="utf-8",
+          )
+
+          print("Private Wi-Fi header created.")
+          print("SSID configured: yes")
+          print("Password configured:", "yes" if password else "no")
+          PY
+
+
       - name: Ensure factory partition is large enough
         shell: bash
         run: |
@@ -99,6 +134,11 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm             --user "$(id -u):$(id -g)"             -e HOME=/tmp/koyoda-idf-home             -e CCACHE_DISABLE=1             -v "$GITHUB_WORKSPACE:/project"             -w /project             espressif/idf:v5.5.4             bash -c 'set -euo pipefail; mkdir -p "$HOME"; idf.py --version; idf.py -B build-ci build'             2>&1 | tee koyoda-build.log
+
+      - name: Remove private Wi-Fi build header
+        if: always()
+        shell: bash
+        run: rm -f main/koyoda_wifi_secrets.h
 
       - name: Package firmware and verify assets stayed unchanged
         shell: bash
