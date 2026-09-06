@@ -15,6 +15,7 @@
 
 #include "pmu_bridge.h"
 #include "koyoda_animation.h"
+#include "koyoda_motion_ui.h"
 
 LV_IMAGE_DECLARE(koyoda_idle);
 LV_IMAGE_DECLARE(koyoda_half);
@@ -692,13 +693,35 @@ static void face_animation_step(void)
         &koyoda_charge_1, &koyoda_charge_2, &koyoda_charge_3,
         &koyoda_charge_4, &koyoda_charge_5, &koyoda_charge_6
     };
+
     bsp_display_lock(-1);
-    unsigned frame = anim_tick(&animation, lv_tick_get(), current_page == PAGE_FACE,
-                              power_dialog_open, touch_held, &charging_animation_pending);
-    if (current_page == PAGE_FACE && !power_dialog_open &&
-        lv_image_get_src(face_img) != frames[frame]) {
-        lv_image_set_src(face_img, frames[frame]);
+
+    /*
+     * While a QMI8658 reaction is active, the integrated motion module
+     * owns face_img.  Pause blink/sleep/charging frame progression so
+     * the normal animation loop does not overwrite the gyro expression.
+     *
+     * charging_animation_pending is NOT consumed while motion is active,
+     * so a real charging animation can still play immediately afterward.
+     */
+    if (!koyoda_motion_ui_is_active())
+    {
+        unsigned frame = anim_tick(
+            &animation,
+            lv_tick_get(),
+            current_page == PAGE_FACE,
+            power_dialog_open,
+            touch_held,
+            &charging_animation_pending);
+
+        if (current_page == PAGE_FACE &&
+            !power_dialog_open &&
+            lv_image_get_src(face_img) != frames[frame])
+        {
+            lv_image_set_src(face_img, frames[frame]);
+        }
     }
+
     bsp_display_unlock();
     vTaskDelay(pdMS_TO_TICKS(20));
 }
@@ -753,6 +776,21 @@ void app_main(void)
     anim_reset(&animation, lv_tick_get());
 
     bsp_display_unlock();
+
+    /*
+     * QMI8658 reaction engine.
+     * This version uses an LVGL timer only: no extra FreeRTOS reaction task,
+     * so it avoids the watchdog problem from the previous implementation.
+     */
+    esp_err_t motion_err = koyoda_motion_ui_init(face_img);
+
+    if (motion_err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Motion UI init failed: %s",
+            esp_err_to_name(motion_err));
+    }
 
     ESP_LOGI(TAG, "KOYODA UI ready: Face <-> Battery; future page slot reserved");
 
