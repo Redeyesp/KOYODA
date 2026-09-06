@@ -151,14 +151,20 @@ static void set_state(reaction_state_t next, float amag, float gmag, float tilt_
         state_name(next), amag, gmag, tilt_deg
     );
 
-    bsp_display_lock(-1);
-    render_state_locked();
-    bsp_display_unlock();
+    if (bsp_display_lock(20)) {
+        render_state_locked();
+        bsp_display_unlock();
+    } else {
+        ESP_LOGW(TAG, "Display busy; skipped reaction frame");
+    }
 }
 
 static bool create_overlay(void)
 {
-    bsp_display_lock(-1);
+    if (!bsp_display_lock(50)) {
+        ESP_LOGW(TAG, "Display lock busy while creating reaction overlay");
+        return false;
+    }
 
     lv_obj_t *screen = lv_screen_active();
     uint32_t count = lv_obj_get_child_count(screen);
@@ -364,13 +370,12 @@ static void reaction_task(void *arg)
     /* Give KOYODA's existing UI a moment to finish creating its children. */
     vTaskDelay(pdMS_TO_TICKS(800));
 
-    if (!create_overlay()) {
-        ESP_LOGE(TAG, "Could not find/create KOYODA face overlay");
-        vTaskDelete(NULL);
-        return;
+    while (!create_overlay()) {
+        ESP_LOGW(TAG, "Reaction overlay not ready yet; retrying");
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 
-    ESP_LOGI(TAG, "QMI8658 reaction engine ready");
+    ESP_LOGI(TAG, "QMI8658 reaction engine ready (WDT-safe UI mode)");
     ESP_LOGI(
         TAG,
         "Thresholds: trigger G>%.2f / tilt>%.0f deg; strong G>%.2f; peak G>%.2f",
@@ -411,14 +416,11 @@ static void reaction_task(void *arg)
         }
 
         /*
-         * Keep the overlay synchronized with FACE/BATTERY visibility even
-         * when the reaction state itself has not changed.
+         * Important: do NOT continuously lock LVGL from the IMU task.
+         * The previous Step 2 could block the display task long enough to
+         * starve IDLE0 and trigger the task watchdog. Reaction UI is now
+         * updated only on state transitions with a finite lock timeout.
          */
-        bsp_display_lock(-1);
-        render_state_locked();
-        bsp_display_unlock();
-
-        /* 20 Hz is responsive while remaining light on the ESP32-S3. */
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
@@ -430,7 +432,7 @@ static void __attribute__((constructor)) reaction_autostart(void)
         "koyoda_reaction",
         6144,
         NULL,
-        3,
+        2,
         NULL
     );
 
