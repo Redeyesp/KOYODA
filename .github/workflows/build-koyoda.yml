@@ -30,6 +30,33 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
+      - name: Create Wi-Fi secrets header
+        shell: bash
+        env:
+          KOYODA_WIFI_SSID: ${{ secrets.KOYODA_WIFI_SSID }}
+          KOYODA_WIFI_PASSWORD: ${{ secrets.KOYODA_WIFI_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          ssid = os.environ.get("KOYODA_WIFI_SSID", "")
+          password = os.environ.get("KOYODA_WIFI_PASSWORD", "")
+
+          Path("main/koyoda_wifi_secrets.h").write_text(
+              "#pragma once\n"
+              f"#define KOYODA_WIFI_SSID {json.dumps(ssid, ensure_ascii=False)}\n"
+              f"#define KOYODA_WIFI_PASSWORD {json.dumps(password, ensure_ascii=False)}\n",
+              encoding="utf-8",
+          )
+
+          print("Wi-Fi credentials header generated.")
+          print("SSID configured:", bool(ssid))
+          print("Password configured:", bool(password))
+          PY
+
       - name: Verify source and preserved KOYODA assets
         shell: bash
         run: |
