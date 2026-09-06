@@ -40,12 +40,21 @@ static lv_obj_t *battery_fill = NULL;
 static lv_obj_t *battery_percent_label = NULL;
 static lv_obj_t *battery_status_label = NULL;
 static lv_obj_t *battery_voltage_label = NULL;
+
+static lv_obj_t *wifi_page = NULL;
+static lv_obj_t *wifi_status_label = NULL;
+static lv_obj_t *wifi_detail_label = NULL;
+static lv_obj_t *wifi_rssi_label = NULL;
+static lv_obj_t *wifi_signal_bars[4] = {NULL, NULL, NULL, NULL};
+
 static lv_obj_t *swipe_layer = NULL;
 
 static esp_io_expander_handle_t io_expander = NULL;
 
 static volatile bool power_dialog_open = false;
 static volatile bool battery_refresh_requested = false;
+static volatile bool wifi_refresh_requested = false;
+static uint32_t wifi_last_refresh_ms = 0;
 
 /* Real AXP2101 charging-event state.
  * The animation is triggered on a false -> true charging transition.
@@ -75,11 +84,11 @@ typedef enum
 {
     PAGE_FACE = 0,
     PAGE_BATTERY,
-    PAGE_FUTURE,
+    PAGE_WIFI,
     PAGE_COUNT
 } koyoda_page_t;
 
-#define KOYODA_ENABLED_PAGE_COUNT 2
+#define KOYODA_ENABLED_PAGE_COUNT 3
 #define KOYODA_SWIPE_THRESHOLD_PX 70
 
 static volatile koyoda_page_t current_page = PAGE_FACE;
@@ -373,6 +382,207 @@ static void create_battery_page(lv_obj_t *screen)
     lv_obj_add_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
 }
 
+/* =========================================================
+ * Wi-Fi Status UI
+ *
+ * Important: the Wi-Fi networking task still never touches LVGL.
+ * This page only READS the thread-safe status getters from the
+ * existing background Wi-Fi module.
+ * ========================================================= */
+
+static void set_wifi_bar_level_locked(int bars)
+{
+    for (int i = 0; i < 4; ++i)
+    {
+        if (wifi_signal_bars[i] == NULL)
+        {
+            continue;
+        }
+
+        lv_obj_set_style_bg_color(
+            wifi_signal_bars[i],
+            (i < bars) ? lv_color_hex(0x00D5D5) : lv_color_hex(0x303030),
+            0);
+    }
+}
+
+static void update_wifi_ui_locked(void)
+{
+    if (wifi_page == NULL)
+    {
+        return;
+    }
+
+    const bool connected = koyoda_wifi_is_connected();
+    const int rssi = koyoda_wifi_get_rssi();
+
+    if (!connected)
+    {
+        lv_label_set_text(wifi_status_label, "CONNECTING...");
+        lv_obj_set_style_text_color(
+            wifi_status_label,
+            lv_color_hex(0xFF7FA3),
+            0);
+
+        lv_label_set_text(
+            wifi_detail_label,
+            "Waiting for Wi-Fi");
+
+        lv_label_set_text(
+            wifi_rssi_label,
+            "RSSI -- dBm");
+
+        set_wifi_bar_level_locked(0);
+        return;
+    }
+
+    /*
+     * koyoda_wifi_is_connected() becomes true only after
+     * IP_EVENT_STA_GOT_IP, so CONNECTED means association + DHCP succeeded.
+     */
+    lv_label_set_text(wifi_status_label, "CONNECTED");
+    lv_obj_set_style_text_color(
+        wifi_status_label,
+        lv_color_hex(0x00D5D5),
+        0);
+
+    lv_label_set_text(
+        wifi_detail_label,
+        "IP acquired");
+
+    char rssi_text[32];
+    snprintf(
+        rssi_text,
+        sizeof(rssi_text),
+        "RSSI %d dBm",
+        rssi);
+    lv_label_set_text(wifi_rssi_label, rssi_text);
+
+    int bars = 1;
+    if (rssi >= -55)
+    {
+        bars = 4;
+    }
+    else if (rssi >= -67)
+    {
+        bars = 3;
+    }
+    else if (rssi >= -75)
+    {
+        bars = 2;
+    }
+
+    set_wifi_bar_level_locked(bars);
+}
+
+static void create_wifi_page(lv_obj_t *screen)
+{
+    wifi_page = lv_obj_create(screen);
+    lv_obj_set_size(wifi_page, 466, 466);
+    lv_obj_center(wifi_page);
+    lv_obj_set_style_bg_color(wifi_page, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(wifi_page, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(wifi_page, 0, 0);
+    lv_obj_set_style_pad_all(wifi_page, 0, 0);
+    lv_obj_set_style_radius(wifi_page, 0, 0);
+    lv_obj_clear_flag(wifi_page, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Same confirmed 90-degree physical orientation as Face/Battery. */
+    lv_obj_set_style_transform_pivot_x(wifi_page, 233, 0);
+    lv_obj_set_style_transform_pivot_y(wifi_page, 233, 0);
+    lv_obj_set_style_transform_rotation(wifi_page, 900, 0);
+
+    lv_obj_t *title = lv_label_create(wifi_page);
+    lv_label_set_text(title, "WI-FI");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 72);
+
+    /* Simple four-bar signal meter. */
+    const int heights[4] = {22, 38, 54, 70};
+    for (int i = 0; i < 4; ++i)
+    {
+        wifi_signal_bars[i] = lv_obj_create(wifi_page);
+        lv_obj_set_size(wifi_signal_bars[i], 24, heights[i]);
+        lv_obj_set_style_bg_color(
+            wifi_signal_bars[i],
+            lv_color_hex(0x303030),
+            0);
+        lv_obj_set_style_bg_opa(
+            wifi_signal_bars[i],
+            LV_OPA_COVER,
+            0);
+        lv_obj_set_style_border_width(
+            wifi_signal_bars[i],
+            0,
+            0);
+        lv_obj_set_style_radius(
+            wifi_signal_bars[i],
+            5,
+            0);
+        lv_obj_clear_flag(
+            wifi_signal_bars[i],
+            LV_OBJ_FLAG_SCROLLABLE);
+
+        /* Bottom-align the bars around the page center. */
+        lv_obj_align(
+            wifi_signal_bars[i],
+            LV_ALIGN_CENTER,
+            -69 + (i * 46),
+            -28 + ((70 - heights[i]) / 2));
+    }
+
+    wifi_status_label = lv_label_create(wifi_page);
+    lv_label_set_text(wifi_status_label, "CONNECTING...");
+    lv_obj_set_style_text_color(
+        wifi_status_label,
+        lv_color_hex(0xFF7FA3),
+        0);
+    lv_obj_set_style_text_font(
+        wifi_status_label,
+        &lv_font_montserrat_14,
+        0);
+    lv_obj_align(
+        wifi_status_label,
+        LV_ALIGN_CENTER,
+        0,
+        70);
+
+    wifi_detail_label = lv_label_create(wifi_page);
+    lv_label_set_text(wifi_detail_label, "Waiting for Wi-Fi");
+    lv_obj_set_style_text_color(
+        wifi_detail_label,
+        lv_color_hex(0xFFFFFF),
+        0);
+    lv_obj_set_style_text_font(
+        wifi_detail_label,
+        &lv_font_montserrat_14,
+        0);
+    lv_obj_align(
+        wifi_detail_label,
+        LV_ALIGN_CENTER,
+        0,
+        102);
+
+    wifi_rssi_label = lv_label_create(wifi_page);
+    lv_label_set_text(wifi_rssi_label, "RSSI -- dBm");
+    lv_obj_set_style_text_color(
+        wifi_rssi_label,
+        lv_color_hex(0x888888),
+        0);
+    lv_obj_set_style_text_font(
+        wifi_rssi_label,
+        &lv_font_montserrat_14,
+        0);
+    lv_obj_align(
+        wifi_rssi_label,
+        LV_ALIGN_CENTER,
+        0,
+        134);
+
+    lv_obj_add_flag(wifi_page, LV_OBJ_FLAG_HIDDEN);
+}
+
 /* Called only from an LVGL event callback, so do not take the BSP LVGL lock here. */
 static void set_page_from_lvgl(koyoda_page_t page)
 {
@@ -382,22 +592,40 @@ static void set_page_from_lvgl(koyoda_page_t page)
     }
 
     current_page = page;
-    if (animation.mode == ANIM_CHARGE) charging_animation_pending = true;
+
+    if (animation.mode == ANIM_CHARGE)
+    {
+        charging_animation_pending = true;
+    }
+
     anim_reset(&animation, lv_tick_get());
+
+    /*
+     * Hard mutual exclusion:
+     * hide every content page first, then show exactly one.
+     * This prevents the Face/Battery/Wi-Fi overlay bug by construction.
+     */
+    lv_obj_add_flag(face_img, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(wifi_page, LV_OBJ_FLAG_HIDDEN);
 
     if (page == PAGE_FACE)
     {
-        lv_obj_add_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(face_img, LV_OBJ_FLAG_HIDDEN);
         lv_image_set_src(face_img, &koyoda_idle);
         ESP_LOGI(TAG, "Page -> FACE");
     }
     else if (page == PAGE_BATTERY)
     {
-        lv_obj_add_flag(face_img, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
         battery_refresh_requested = true;
         ESP_LOGI(TAG, "Page -> BATTERY");
+    }
+    else if (page == PAGE_WIFI)
+    {
+        lv_obj_clear_flag(wifi_page, LV_OBJ_FLAG_HIDDEN);
+        wifi_refresh_requested = true;
+        ESP_LOGI(TAG, "Page -> WIFI");
     }
 }
 
@@ -407,7 +635,6 @@ static void navigate_next_from_lvgl(void)
 
     if (next >= KOYODA_ENABLED_PAGE_COUNT)
     {
-        ESP_LOGI(TAG, "Next page slot is reserved for a future menu");
         return;
     }
 
@@ -734,12 +961,37 @@ static void face_animation_step(void)
         &fun_happy
     };
     bsp_display_lock(-1);
-    unsigned frame = anim_tick(&animation, lv_tick_get(), current_page == PAGE_FACE,
-                              power_dialog_open, touch_held, &charging_animation_pending);
-    if (current_page == PAGE_FACE && !power_dialog_open &&
-        lv_image_get_src(face_img) != frames[frame]) {
+
+    uint32_t now_ms = lv_tick_get();
+
+    unsigned frame = anim_tick(
+        &animation,
+        now_ms,
+        current_page == PAGE_FACE,
+        power_dialog_open,
+        touch_held,
+        &charging_animation_pending);
+
+    if (current_page == PAGE_FACE &&
+        !power_dialog_open &&
+        lv_image_get_src(face_img) != frames[frame])
+    {
         lv_image_set_src(face_img, frames[frame]);
     }
+
+    /*
+     * Wi-Fi page refresh is owned by this same UI loop.
+     * The networking task still never calls LVGL.
+     */
+    if (current_page == PAGE_WIFI &&
+        (wifi_refresh_requested ||
+         (uint32_t)(now_ms - wifi_last_refresh_ms) >= 500U))
+    {
+        update_wifi_ui_locked();
+        wifi_refresh_requested = false;
+        wifi_last_refresh_ms = now_ms;
+    }
+
     bsp_display_unlock();
     vTaskDelay(pdMS_TO_TICKS(20));
 }
@@ -790,12 +1042,13 @@ void app_main(void)
     lv_obj_center(face_img);
 
     create_battery_page(screen);
+    create_wifi_page(screen);
     create_swipe_layer(screen);
     anim_reset(&animation, lv_tick_get());
 
     bsp_display_unlock();
 
-    ESP_LOGI(TAG, "KOYODA UI ready: Face <-> Battery; future page slot reserved");
+    ESP_LOGI(TAG, "KOYODA UI ready: Face <-> Battery <-> Wi-Fi");
 
     /*
      * Wi-Fi Clean Step 1:
