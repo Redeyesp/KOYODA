@@ -14,6 +14,12 @@ idf_component_register(
          "koyoda_sleep_2.c"
          "koyoda_sleep_3.c"
          "fun_happy.c"
+         "koyoda_wifi.c"
     INCLUDE_DIRS "."
-    REQUIRES XPowersLib
+    REQUIRES
+         XPowersLib
+         esp_wifi
+         esp_event
+         esp_netif
+         nvs_flash
 )
