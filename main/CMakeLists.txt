@@ -1,6 +1,5 @@
 idf_component_register(
     SRCS "main.c"
-         "koyoda_wifi.c"
          "pmu_bridge.cpp"
          "koyoda_idle.c"
          "koyoda_half.c"
@@ -16,5 +15,5 @@ idf_component_register(
          "koyoda_sleep_3.c"
          "fun_happy.c"
     INCLUDE_DIRS "."
-    REQUIRES XPowersLib esp_wifi esp_event esp_netif esp_timer nvs_flash
+    REQUIRES XPowersLib
 )

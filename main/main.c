@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -16,7 +15,6 @@
 
 #include "pmu_bridge.h"
 #include "koyoda_animation.h"
-#include "koyoda_wifi.h"
 
 LV_IMAGE_DECLARE(koyoda_idle);
 LV_IMAGE_DECLARE(koyoda_half);
@@ -41,7 +39,6 @@ static lv_obj_t *battery_fill = NULL;
 static lv_obj_t *battery_percent_label = NULL;
 static lv_obj_t *battery_status_label = NULL;
 static lv_obj_t *battery_voltage_label = NULL;
-static lv_obj_t *wifi_status_label = NULL;
 static lv_obj_t *swipe_layer = NULL;
 
 static esp_io_expander_handle_t io_expander = NULL;
@@ -185,41 +182,6 @@ static void update_battery_ui_locked(const pmu_battery_status_t *status, bool va
     lv_label_set_text(battery_voltage_label, voltage_text);
 }
 
-/* The snapshot is copied before acquiring the display lock. No driver
- * calls happen here, and only a changed label needs repainting. */
-static void update_wifi_ui_locked(const koyoda_wifi_status_t *status)
-{
-    char text[48];
-    uint32_t color = 0x888888;
-    switch (status->state) {
-        case KOYODA_WIFI_CONNECTED:
-            snprintf(text, sizeof(text), "Wi-Fi: %s", status->ip);
-            color = 0x00D5D5;
-            break;
-        case KOYODA_WIFI_STARTING:
-            snprintf(text, sizeof(text), "Wi-Fi: Starting");
-            break;
-        case KOYODA_WIFI_CONNECTING:
-            snprintf(text, sizeof(text), "Wi-Fi: Connecting");
-            break;
-        case KOYODA_WIFI_RETRYING:
-            snprintf(text, sizeof(text), "Wi-Fi: Retrying");
-            color = 0xFF7FA3;
-            break;
-        case KOYODA_WIFI_ERROR:
-            snprintf(text, sizeof(text), "Wi-Fi: Setup error");
-            color = 0xFF7FA3;
-            break;
-        default:
-            snprintf(text, sizeof(text), "Wi-Fi: Off");
-            break;
-    }
-    if (wifi_status_label != NULL && strcmp(lv_label_get_text(wifi_status_label), text) != 0) {
-        lv_label_set_text(wifi_status_label, text);
-        lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(color), 0);
-    }
-}
-
 static void battery_status_task(void *arg)
 {
     (void)arg;
@@ -275,11 +237,8 @@ static void battery_status_task(void *arg)
          */
         if (current_page == PAGE_BATTERY || battery_refresh_requested)
         {
-            koyoda_wifi_status_t wifi;
-            koyoda_wifi_get_status(&wifi);
             bsp_display_lock(-1);
             update_battery_ui_locked(&status, valid);
-            update_wifi_ui_locked(&wifi);
             bsp_display_unlock();
 
             if (valid)
@@ -371,14 +330,6 @@ static void create_battery_page(lv_obj_t *screen)
     lv_obj_set_style_text_color(battery_voltage_label, lv_color_hex(0x888888), 0);
     lv_obj_set_style_text_font(battery_voltage_label, &lv_font_montserrat_14, 0);
     lv_obj_align(battery_voltage_label, LV_ALIGN_CENTER, 0, 132);
-
-    wifi_status_label = lv_label_create(battery_page);
-    lv_label_set_text(wifi_status_label, "Wi-Fi: Off");
-    lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0x888888), 0);
-    lv_obj_set_style_text_font(wifi_status_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_width(wifi_status_label, 260);
-    lv_obj_set_style_text_align(wifi_status_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(wifi_status_label, LV_ALIGN_TOP_MID, 0, 390);
 
     lv_obj_add_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
 }
@@ -822,12 +773,6 @@ void app_main(void)
         NULL,
         4,
         NULL);
-
-    /* Only schedules the worker. No display lock is held here. */
-    esp_err_t wifi_err = koyoda_wifi_start();
-    if (wifi_err != ESP_OK) {
-        ESP_LOGW(TAG, "Wi-Fi unavailable: %s; continuing face animation", esp_err_to_name(wifi_err));
-    }
 
     /*
      * No fake boot animation here.
