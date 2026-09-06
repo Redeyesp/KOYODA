@@ -17,9 +17,11 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+
     env:
       SOURCE_SHA: ${{ github.sha }}
       KOYODA_ENABLE_WIFI: ${{ inputs.enable_wifi && 'true' || 'false' }}
+
     steps:
       - name: Check out selected source commit
         uses: actions/checkout@v5
@@ -27,12 +29,23 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Verify stable assets and run host tests
+      - name: Create preservation manifest and run host tests
         shell: bash
         run: |
           set -euo pipefail
+
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+          # Create checksum manifest from the exact source selected for this build.
+          # Only tracked files are included.
+          git ls-files -z -- main assets partitions.csv \
+            | sort -z \
+            | xargs -0 sha256sum \
+            > wifi-preserved.sha256
+
+          test -s wifi-preserved.sha256
           sha256sum -c wifi-preserved.sha256
+
           python3 tools/test_wifi.py
 
       - name: Generate private Wi-Fi build input
@@ -42,17 +55,29 @@ jobs:
           KOYODA_WIFI_PASSWORD: ${{ secrets.KOYODA_WIFI_PASSWORD }}
         run: |
           set -euo pipefail
+
           if [ "$KOYODA_ENABLE_WIFI" = "true" ]; then
+
+            if [ -z "${KOYODA_WIFI_SSID:-}" ]; then
+              echo "::error::KOYODA_WIFI_SSID secret is missing or empty"
+              exit 1
+            fi
+
             python3 tools/generate_wifi_secrets.py
+
           else
             python3 tools/generate_wifi_secrets.py --disabled
           fi
+
+          test -f main/koyoda_wifi_secrets.h
 
       - name: Build with ESP-IDF 5.5.4
         shell: bash
         run: |
           set -euo pipefail
+
           trap 'rm -f main/koyoda_wifi_secrets.h' EXIT
+
           docker run --rm \
             --user "$(id -u):$(id -g)" \
             -e HOME=/tmp/koyoda-idf-home \
@@ -63,20 +88,29 @@ jobs:
             bash -c 'set -euo pipefail; mkdir -p "$HOME"; idf.py --version; idf.py -B build-ci build' \
             2>&1 | tee koyoda-wifi-build.log
 
-      - name: Package flashable firmware
+      - name: Verify preserved source and package firmware
         shell: bash
         run: |
           set -euo pipefail
-          # IDF can normalize sdkconfig on build; check artwork and animation
-          # again, and package the sdkconfig actually used for this build.
-          awk '$2 ~ /^main\// || $2 == "partitions.csv" {print}' wifi-preserved.sha256 | sha256sum -c -
-          git diff --exit-code -- main assets partitions.csv
+
+          # Private credentials must already be gone.
+          test ! -e main/koyoda_wifi_secrets.h
+
+          # Check that the build did not modify KOYODA source/assets.
+          sha256sum -c wifi-preserved.sha256
+
+          git diff --exit-code -- \
+            main \
+            assets \
+            partitions.csv
+
           python3 tools/package_wifi_firmware.py
 
       - name: Remove private build input
         if: always()
         shell: bash
-        run: rm -f main/koyoda_wifi_secrets.h
+        run: |
+          rm -f main/koyoda_wifi_secrets.h
 
       - name: Upload firmware
         uses: actions/upload-artifact@v6
