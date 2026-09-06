@@ -1,16 +1,9 @@
 #include "esp_log.h"
 
-/*
- * Emergency recovery build:
- * The QMI8658 reaction task is intentionally disabled.
- *
- * This file has NO constructor and creates NO FreeRTOS task.
- * It exists only so the local component still builds cleanly.
+/* Old experimental motion component intentionally disabled.
+ * Step 4 motion lives in main/koyoda_motion_inline.c.
  */
-
-static const char *TAG = "KOYODA_MOTION";
-
-void koyoda_motion_recovery_marker(void)
+void koyoda_motion_probe_disabled(void)
 {
-    ESP_LOGI(TAG, "Motion reaction disabled for recovery build");
+    ESP_LOGD("KOYODA_MOTION", "legacy motion component disabled");
 }
