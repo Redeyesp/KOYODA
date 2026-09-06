@@ -17,16 +17,24 @@
 static const char *TAG = "KOYODA_MOTION";
 
 /*
- * Thresholds tuned from KOYODA's real QMI8658 log.
+ * STEP 5 ARCHITECTURE
+ * -------------------
+ * This deliberately returns to the one part that was already proven stable
+ * on the real KOYODA hardware: QMI8658 reading from a small background task.
  *
- * Rest:
- *   |A| ~= 10.29..10.31 m/s2
- *   |G| ~= 0.10..0.14 rad/s
+ * IMPORTANT:
+ * - This task NEVER calls LVGL.
+ * - This task NEVER calls bsp_display_lock().
+ * - This task NEVER changes face_img.
+ * - The existing app_main()/face_animation_step() remains the ONLY owner of UI.
  *
- * Strong hand motion:
- *   |G| commonly 4..8 rad/s
- *   peaks about 12.64 rad/s
+ * Step 2 failed because the sensor task also touched LVGL.
+ * Step 3 failed because QMI I2C was read from an LVGL timer.
+ * Step 4 could block the existing app_main animation loop with synchronous I2C.
+ *
+ * Here the worker only updates a tiny reaction_state_t value.
  */
+
 #define KOYODA_GRAVITY_BASE         10.30f
 
 #define TRIGGER_GYRO                 0.80f
@@ -45,6 +53,7 @@ static const char *TAG = "KOYODA_MOTION";
 
 #define SENSOR_POLL_MS             100U
 #define REACTION_COOLDOWN_MS       700U
+#define SENSOR_START_DELAY_MS     1500U
 
 typedef enum
 {
@@ -58,17 +67,22 @@ typedef enum
 } reaction_state_t;
 
 static qmi8658_dev_t s_imu;
-static bool s_ready = false;
 
+static volatile bool s_worker_started = false;
+static volatile bool s_sensor_ready = false;
+
+/*
+ * Protect the small state handoff between the sensor worker and app_main.
+ * No LVGL work is done while holding this lock.
+ */
+static portMUX_TYPE s_state_mux = portMUX_INITIALIZER_UNLOCKED;
 static reaction_state_t s_state = REACT_IDLE;
 
-static TickType_t s_last_poll_tick = 0;
 static TickType_t s_state_enter_tick = 0;
 static TickType_t s_settle_since_tick = 0;
 static TickType_t s_cooldown_until_tick = 0;
 
 static bool s_strong_latched = false;
-static bool s_peak_latched = false;
 
 static const char *state_name(reaction_state_t state)
 {
@@ -99,14 +113,9 @@ static const lv_image_dsc_t *state_image(reaction_state_t state)
     }
 }
 
-static uint32_t ticks_to_ms(TickType_t ticks)
-{
-    return (uint32_t)(ticks * portTICK_PERIOD_MS);
-}
-
 static uint32_t elapsed_ms(TickType_t start, TickType_t now)
 {
-    return ticks_to_ms(now - start);
+    return (uint32_t)((now - start) * portTICK_PERIOD_MS);
 }
 
 static float clampf_local(float value, float low, float high)
@@ -116,6 +125,24 @@ static float clampf_local(float value, float low, float high)
     return value;
 }
 
+static void publish_state(reaction_state_t next)
+{
+    portENTER_CRITICAL(&s_state_mux);
+    s_state = next;
+    portEXIT_CRITICAL(&s_state_mux);
+}
+
+static reaction_state_t read_state(void)
+{
+    reaction_state_t state;
+
+    portENTER_CRITICAL(&s_state_mux);
+    state = s_state;
+    portEXIT_CRITICAL(&s_state_mux);
+
+    return state;
+}
+
 static void enter_state(
     reaction_state_t next,
     TickType_t now,
@@ -123,12 +150,12 @@ static void enter_state(
     float gmag,
     float tilt_deg)
 {
-    if (next == s_state)
+    if (read_state() == next)
     {
         return;
     }
 
-    s_state = next;
+    publish_state(next);
     s_state_enter_tick = now;
     s_settle_since_tick = 0;
 
@@ -143,12 +170,13 @@ static void enter_state(
 
 static void finish_reaction(TickType_t now)
 {
-    s_state = REACT_IDLE;
+    publish_state(REACT_IDLE);
+
     s_state_enter_tick = now;
     s_settle_since_tick = 0;
     s_strong_latched = false;
-    s_peak_latched = false;
-    s_cooldown_until_tick = now + pdMS_TO_TICKS(REACTION_COOLDOWN_MS);
+    s_cooldown_until_tick =
+        now + pdMS_TO_TICKS(REACTION_COOLDOWN_MS);
 
     ESP_LOGI(TAG, "STATE -> IDLE");
 }
@@ -159,7 +187,8 @@ static void update_state_machine(
     float gmag,
     float tilt_deg)
 {
-    float accel_dev = fabsf(amag - KOYODA_GRAVITY_BASE);
+    float accel_dev =
+        fabsf(amag - KOYODA_GRAVITY_BASE);
 
     bool mild =
         (gmag > TRIGGER_GYRO) ||
@@ -169,10 +198,6 @@ static void update_state_machine(
     bool strong =
         (gmag > STRONG_GYRO) ||
         (accel_dev > STRONG_ACCEL_DEV);
-
-    bool peak =
-        (gmag > PEAK_GYRO) ||
-        (accel_dev > PEAK_ACCEL_DEV);
 
     bool calm =
         (gmag < CALM_GYRO) &&
@@ -186,12 +211,9 @@ static void update_state_machine(
         s_strong_latched = true;
     }
 
-    if (peak)
-    {
-        s_peak_latched = true;
-    }
+    reaction_state_t state = read_state();
 
-    switch (s_state)
+    switch (state)
     {
         case REACT_IDLE:
             if ((int32_t)(now - s_cooldown_until_tick) < 0)
@@ -202,15 +224,24 @@ static void update_state_machine(
             if (mild)
             {
                 s_strong_latched = strong;
-                s_peak_latched = peak;
-                enter_state(REACT_EXCITED, now, amag, gmag, tilt_deg);
+                enter_state(
+                    REACT_EXCITED,
+                    now,
+                    amag,
+                    gmag,
+                    tilt_deg);
             }
             break;
 
         case REACT_EXCITED:
             if (elapsed_ms(s_state_enter_tick, now) >= 200)
             {
-                enter_state(REACT_TILT, now, amag, gmag, tilt_deg);
+                enter_state(
+                    REACT_TILT,
+                    now,
+                    amag,
+                    gmag,
+                    tilt_deg);
             }
             break;
 
@@ -218,7 +249,12 @@ static void update_state_machine(
             if (s_strong_latched &&
                 elapsed_ms(s_state_enter_tick, now) >= 200)
             {
-                enter_state(REACT_DROP, now, amag, gmag, tilt_deg);
+                enter_state(
+                    REACT_DROP,
+                    now,
+                    amag,
+                    gmag,
+                    tilt_deg);
                 break;
             }
 
@@ -228,9 +264,17 @@ static void update_state_machine(
                 {
                     s_settle_since_tick = now;
                 }
-                else if (elapsed_ms(s_settle_since_tick, now) >= 400)
+                else if (
+                    elapsed_ms(
+                        s_settle_since_tick,
+                        now) >= 400)
                 {
-                    enter_state(REACT_HAPPY, now, amag, gmag, tilt_deg);
+                    enter_state(
+                        REACT_HAPPY,
+                        now,
+                        amag,
+                        gmag,
+                        tilt_deg);
                 }
             }
             else
@@ -242,7 +286,12 @@ static void update_state_machine(
         case REACT_DROP:
             if (elapsed_ms(s_state_enter_tick, now) >= 200)
             {
-                enter_state(REACT_PEAK, now, amag, gmag, tilt_deg);
+                enter_state(
+                    REACT_PEAK,
+                    now,
+                    amag,
+                    gmag,
+                    tilt_deg);
             }
             break;
 
@@ -254,9 +303,16 @@ static void update_state_machine(
                     (accel_dev < 2.5f);
 
                 if (settled_enough ||
-                    elapsed_ms(s_state_enter_tick, now) >= 1000)
+                    elapsed_ms(
+                        s_state_enter_tick,
+                        now) >= 1000)
                 {
-                    enter_state(REACT_DIZZY, now, amag, gmag, tilt_deg);
+                    enter_state(
+                        REACT_DIZZY,
+                        now,
+                        amag,
+                        gmag,
+                        tilt_deg);
                 }
             }
             break;
@@ -264,7 +320,12 @@ static void update_state_machine(
         case REACT_DIZZY:
             if (elapsed_ms(s_state_enter_tick, now) >= 700)
             {
-                enter_state(REACT_HAPPY, now, amag, gmag, tilt_deg);
+                enter_state(
+                    REACT_HAPPY,
+                    now,
+                    amag,
+                    gmag,
+                    tilt_deg);
             }
             break;
 
@@ -277,14 +338,27 @@ static void update_state_machine(
     }
 }
 
-esp_err_t koyoda_motion_init(void)
+static void motion_sensor_task(void *arg)
 {
-    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+    (void)arg;
+
+    /*
+     * Let KOYODA finish normal display / PMU / IO setup first.
+     * The earlier standalone QMI probe was stable with delayed startup.
+     */
+    vTaskDelay(pdMS_TO_TICKS(SENSOR_START_DELAY_MS));
+
+    i2c_master_bus_handle_t bus =
+        bsp_i2c_get_handle();
 
     if (bus == NULL)
     {
-        ESP_LOGE(TAG, "BSP I2C bus is not ready");
-        return ESP_ERR_INVALID_STATE;
+        ESP_LOGE(
+            TAG,
+            "Sensor worker: BSP I2C bus not ready");
+        s_worker_started = false;
+        vTaskDelete(NULL);
+        return;
     }
 
     esp_err_t ret = qmi8658_init(
@@ -294,130 +368,208 @@ esp_err_t koyoda_motion_init(void)
 
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "QMI8658 init failed: %s", esp_err_to_name(ret));
-        return ret;
+        ESP_LOGE(
+            TAG,
+            "Sensor worker: QMI8658 init failed: %s",
+            esp_err_to_name(ret));
+        s_worker_started = false;
+        vTaskDelete(NULL);
+        return;
     }
 
     ret = qmi8658_set_accel_range(
         &s_imu,
         QMI8658_ACCEL_RANGE_8G);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) goto init_fail;
 
     ret = qmi8658_set_accel_odr(
         &s_imu,
         QMI8658_ACCEL_ODR_125HZ);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) goto init_fail;
 
     ret = qmi8658_set_gyro_range(
         &s_imu,
         QMI8658_GYRO_RANGE_512DPS);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) goto init_fail;
 
     ret = qmi8658_set_gyro_odr(
         &s_imu,
         QMI8658_GYRO_ODR_125HZ);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) goto init_fail;
 
-    qmi8658_set_accel_unit_mps2(&s_imu, true);
-    qmi8658_set_gyro_unit_rads(&s_imu, true);
+    qmi8658_set_accel_unit_mps2(
+        &s_imu,
+        true);
 
-    TickType_t now = xTaskGetTickCount();
+    qmi8658_set_gyro_unit_rads(
+        &s_imu,
+        true);
 
-    s_last_poll_tick = now;
-    s_state_enter_tick = now;
-    s_cooldown_until_tick = now + pdMS_TO_TICKS(500);
-    s_state = REACT_IDLE;
-    s_ready = true;
+    {
+        TickType_t now =
+            xTaskGetTickCount();
+
+        s_state_enter_tick = now;
+        s_settle_since_tick = 0;
+        s_cooldown_until_tick =
+            now + pdMS_TO_TICKS(500);
+
+        publish_state(REACT_IDLE);
+    }
+
+    s_sensor_ready = true;
 
     ESP_LOGI(
         TAG,
-        "Step4 QMI8658 ready: inline app_main polling; no reaction task/timer");
+        "Step5 QMI8658 ready: low-priority sensor-only task; UI stays in app_main");
+
+    while (1)
+    {
+        bool data_ready = false;
+
+        ret = qmi8658_is_data_ready(
+            &s_imu,
+            &data_ready);
+
+        if (ret == ESP_OK && data_ready)
+        {
+            qmi8658_data_t data = {0};
+
+            ret = qmi8658_read_sensor_data(
+                &s_imu,
+                &data);
+
+            if (ret == ESP_OK)
+            {
+                float amag = sqrtf(
+                    data.accelX * data.accelX +
+                    data.accelY * data.accelY +
+                    data.accelZ * data.accelZ);
+
+                float gmag = sqrtf(
+                    data.gyroX * data.gyroX +
+                    data.gyroY * data.gyroY +
+                    data.gyroZ * data.gyroZ);
+
+                float y_norm = 1.0f;
+
+                if (amag > 0.001f)
+                {
+                    y_norm = clampf_local(
+                        data.accelY / amag,
+                        -1.0f,
+                        1.0f);
+                }
+
+                /*
+                 * Real KOYODA upright log has gravity mainly on +Y.
+                 */
+                float tilt_deg =
+                    acosf(y_norm) * 57.2957795f;
+
+                update_state_machine(
+                    xTaskGetTickCount(),
+                    amag,
+                    gmag,
+                    tilt_deg);
+            }
+            else
+            {
+                ESP_LOGW(
+                    TAG,
+                    "QMI8658 read failed: %s",
+                    esp_err_to_name(ret));
+            }
+        }
+
+        /*
+         * A real delay is mandatory here.
+         * It keeps this sensor worker far away from the watchdog issue
+         * seen in the old UI-touching reaction task.
+         */
+        vTaskDelay(
+            pdMS_TO_TICKS(SENSOR_POLL_MS));
+    }
+
+init_fail:
+    ESP_LOGE(
+        TAG,
+        "Sensor worker configuration failed: %s",
+        esp_err_to_name(ret));
+
+    s_sensor_ready = false;
+    s_worker_started = false;
+    publish_state(REACT_IDLE);
+    vTaskDelete(NULL);
+}
+
+esp_err_t koyoda_motion_init(void)
+{
+    if (s_worker_started)
+    {
+        return ESP_OK;
+    }
+
+    /*
+     * IMPORTANT: return immediately.
+     * QMI8658 is NOT initialized synchronously from app_main anymore.
+     */
+    s_worker_started = true;
+    s_sensor_ready = false;
+    publish_state(REACT_IDLE);
+
+    BaseType_t result = xTaskCreate(
+        motion_sensor_task,
+        "motion_sensor",
+        4096,
+        NULL,
+        1,
+        NULL);
+
+    if (result != pdPASS)
+    {
+        s_worker_started = false;
+
+        ESP_LOGE(
+            TAG,
+            "Failed to create sensor-only task");
+
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Step5 sensor worker scheduled; normal KOYODA UI continues immediately");
 
     return ESP_OK;
 }
 
 void koyoda_motion_poll(void)
 {
-    if (!s_ready)
-    {
-        return;
-    }
-
-    TickType_t now = xTaskGetTickCount();
-
-    if (elapsed_ms(s_last_poll_tick, now) < SENSOR_POLL_MS)
-    {
-        return;
-    }
-
-    s_last_poll_tick = now;
-
-    bool data_ready = false;
-    esp_err_t ret = qmi8658_is_data_ready(
-        &s_imu,
-        &data_ready);
-
-    if (ret != ESP_OK || !data_ready)
-    {
-        return;
-    }
-
-    qmi8658_data_t data = {0};
-
-    ret = qmi8658_read_sensor_data(
-        &s_imu,
-        &data);
-
-    if (ret != ESP_OK)
-    {
-        ESP_LOGW(TAG, "QMI8658 read failed: %s", esp_err_to_name(ret));
-        return;
-    }
-
-    float amag = sqrtf(
-        data.accelX * data.accelX +
-        data.accelY * data.accelY +
-        data.accelZ * data.accelZ);
-
-    float gmag = sqrtf(
-        data.gyroX * data.gyroX +
-        data.gyroY * data.gyroY +
-        data.gyroZ * data.gyroZ);
-
-    float y_norm = 1.0f;
-
-    if (amag > 0.001f)
-    {
-        y_norm = clampf_local(
-            data.accelY / amag,
-            -1.0f,
-            1.0f);
-    }
-
     /*
-     * On the real KOYODA log, normal upright gravity is mainly +Y.
+     * Intentionally empty.
+     *
+     * main.c can keep calling this function so no other file needs changing.
+     * Sensor I2C work happens only in motion_sensor_task().
      */
-    float tilt_deg =
-        acosf(y_norm) * 57.2957795f;
-
-    update_state_machine(
-        now,
-        amag,
-        gmag,
-        tilt_deg);
 }
 
 bool koyoda_motion_is_active(void)
 {
-    return s_ready && s_state != REACT_IDLE;
+    return
+        s_sensor_ready &&
+        read_state() != REACT_IDLE;
 }
 
 const lv_image_dsc_t *koyoda_motion_current_image(void)
 {
-    if (!koyoda_motion_is_active())
+    if (!s_sensor_ready)
     {
         return NULL;
     }
 
-    return state_image(s_state);
+    reaction_state_t state =
+        read_state();
+
+    return state_image(state);
 }
