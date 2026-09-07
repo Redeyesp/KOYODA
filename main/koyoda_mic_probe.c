@@ -28,10 +28,11 @@
 static const char *TAG = "KOYODA_MIC";
 
 #define KOYODA_MIC_SAMPLE_RATE_HZ      22050
-#define KOYODA_MIC_SAMPLES_PER_READ    128
+#define KOYODA_MIC_SAMPLES_PER_READ    256
 #define KOYODA_MIC_START_DELAY_MS      8000
-#define KOYODA_MIC_REPORT_MS           500
+#define KOYODA_MIC_REPORT_MS           1000
 #define KOYODA_MIC_GAIN_DB             24.0f
+#define KOYODA_MIC_CORE                1
 
 static volatile bool s_started = false;
 static volatile bool s_running = false;
@@ -135,8 +136,13 @@ static void mic_probe_task(void *arg)
             if (level > peak) peak = level;
         }
 
-        /* Important: never let a fast audio-read loop monopolize a core. */
-        vTaskDelay(pdMS_TO_TICKS(1));
+        /*
+         * Leave time for the other Core-1 housekeeping tasks.
+         * This probe does not need zero-loss recording yet; its purpose is
+         * to keep the microphone genuinely active while proving KOYODA's
+         * display/animation remain smooth.
+         */
+        vTaskDelay(pdMS_TO_TICKS(5));
 
         TickType_t now = xTaskGetTickCount();
         if ((now - last_report) >= pdMS_TO_TICKS(KOYODA_MIC_REPORT_MS))
@@ -161,13 +167,19 @@ esp_err_t koyoda_mic_probe_start(void)
 
     s_started = true;
 
-    BaseType_t result = xTaskCreate(
+    /*
+     * KOYODA's app_main / face-animation owner is configured on CPU0.
+     * Keep microphone capture on CPU1 so an I2S/codec read can never
+     * stretch the blink timing on the UI core.
+     */
+    BaseType_t result = xTaskCreatePinnedToCore(
         mic_probe_task,
         "mic_probe",
         6144,
         NULL,
         1,
-        NULL);
+        NULL,
+        KOYODA_MIC_CORE);
 
     if (result != pdPASS)
     {
@@ -175,7 +187,7 @@ esp_err_t koyoda_mic_probe_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "Mic safe probe task created; KOYODA core UI remains independent");
+    ESP_LOGI(TAG, "Mic safe probe pinned to CPU%d; UI stays on CPU0", KOYODA_MIC_CORE);
     return ESP_OK;
 }
 
