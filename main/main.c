@@ -16,6 +16,7 @@
 #include "pmu_bridge.h"
 #include "koyoda_animation.h"
 #include "koyoda_wifi.h"
+#include "koyoda_mic_probe.h"
 
 LV_IMAGE_DECLARE(koyoda_idle);
 LV_IMAGE_DECLARE(koyoda_half);
@@ -1062,6 +1063,21 @@ void app_main(void)
             TAG,
             "Wi-Fi start failed: %s; KOYODA continues offline",
             esp_err_to_name(wifi_err));
+    }
+
+    /*
+     * Microphone Probe Step 1:
+     * ES7210 capture runs in its own low-priority task and writes ONLY
+     * to Serial.  It does not touch LVGL, face animation, page state,
+     * charging animation, Wi-Fi UI, or touch.
+     */
+    esp_err_t mic_err = koyoda_mic_probe_start();
+    if (mic_err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Mic probe start failed: %s; KOYODA continues normally",
+            esp_err_to_name(mic_err));
     }
 
     xTaskCreate(
