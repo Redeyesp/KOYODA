@@ -7,17 +7,26 @@ extern "C" {
 #endif
 
 /*
- * Start the speaker event service.
+ * Event-driven ES8311 speaker service.
  *
- * Behavior:
- *   - one short boot beep after ES8311 is ready
- *   - then blocks silently forever
- *   - another beep happens ONLY when beep_charge() is explicitly called
+ * Sound policy:
+ *   - one short beep after boot
+ *   - one short beep after confirmed USB/VBUS insertion
+ *   - one short beep only when the Volume page requests TEST
+ *   - NO repeating timer
  */
 esp_err_t koyoda_speaker_events_start(void);
 
-/* Request one short beep for a confirmed USB/VBUS insertion event. */
 void koyoda_speaker_events_beep_charge(void);
+void koyoda_speaker_events_beep_test(void);
+
+/*
+ * Persistent master speaker volume.
+ * Range: 0..100 (%)
+ * Stored in NVS namespace "koyoda_audio".
+ */
+int koyoda_speaker_events_get_volume(void);
+void koyoda_speaker_events_set_volume(int percent);
 
 #ifdef __cplusplus
 }

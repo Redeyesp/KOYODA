@@ -49,6 +49,10 @@ static lv_obj_t *wifi_detail_label = NULL;
 static lv_obj_t *wifi_rssi_label = NULL;
 static lv_obj_t *wifi_signal_bars[4] = {NULL, NULL, NULL, NULL};
 
+static lv_obj_t *volume_page = NULL;
+static lv_obj_t *volume_percent_label = NULL;
+static lv_obj_t *volume_status_label = NULL;
+
 static lv_obj_t *swipe_layer = NULL;
 
 static esp_io_expander_handle_t io_expander = NULL;
@@ -87,15 +91,20 @@ typedef enum
     PAGE_FACE = 0,
     PAGE_BATTERY,
     PAGE_WIFI,
+    PAGE_VOLUME,
     PAGE_COUNT
 } koyoda_page_t;
 
-#define KOYODA_ENABLED_PAGE_COUNT 3
+#define KOYODA_ENABLED_PAGE_COUNT 4
 #define KOYODA_SWIPE_THRESHOLD_PX 70
 
 static volatile koyoda_page_t current_page = PAGE_FACE;
 static lv_point_t swipe_start = {0, 0};
 static bool swipe_tracking = false;
+
+/* Volume page sits above the transparent global swipe layer while active,
+ * so it reuses this same swipe handler directly. */
+static void swipe_event_cb(lv_event_t *e);
 
 /* =========================================================
  * Face
@@ -586,6 +595,244 @@ static void create_wifi_page(lv_obj_t *screen)
     lv_obj_add_flag(wifi_page, LV_OBJ_FLAG_HIDDEN);
 }
 
+/* =========================================================
+ * Volume UI
+ *
+ * Page order:
+ *   Face -> Battery -> Wi-Fi -> Volume
+ *
+ * Controls:
+ *   - / + : 5% steps, 0..100
+ *   TEST  : one short beep at the selected volume
+ *
+ * The speaker module stores the selected value in NVS.
+ * ========================================================= */
+
+#define KOYODA_VOLUME_STEP 5
+
+static void update_volume_ui_locked(void)
+{
+    if (volume_page == NULL)
+    {
+        return;
+    }
+
+    int volume = koyoda_speaker_events_get_volume();
+
+    char text[16];
+    snprintf(text, sizeof(text), "%d%%", volume);
+    lv_label_set_text(volume_percent_label, text);
+
+    if (volume == 0)
+    {
+        lv_label_set_text(volume_status_label, "MUTED");
+        lv_obj_set_style_text_color(
+            volume_status_label,
+            lv_color_hex(0x888888),
+            0);
+    }
+    else
+    {
+        lv_label_set_text(volume_status_label, "SPEAKER");
+        lv_obj_set_style_text_color(
+            volume_status_label,
+            lv_color_hex(0x00D5D5),
+            0);
+    }
+}
+
+static void volume_minus_button_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+    {
+        return;
+    }
+
+    int volume = koyoda_speaker_events_get_volume() - KOYODA_VOLUME_STEP;
+    if (volume < 0)
+    {
+        volume = 0;
+    }
+
+    koyoda_speaker_events_set_volume(volume);
+    update_volume_ui_locked();
+
+    ESP_LOGI(TAG, "Volume -> %d%%", volume);
+}
+
+static void volume_plus_button_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+    {
+        return;
+    }
+
+    int volume = koyoda_speaker_events_get_volume() + KOYODA_VOLUME_STEP;
+    if (volume > 100)
+    {
+        volume = 100;
+    }
+
+    koyoda_speaker_events_set_volume(volume);
+    update_volume_ui_locked();
+
+    ESP_LOGI(TAG, "Volume -> %d%%", volume);
+}
+
+static void volume_test_button_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+    {
+        return;
+    }
+
+    koyoda_speaker_events_beep_test();
+    ESP_LOGI(
+        TAG,
+        "Volume test requested at %d%%",
+        koyoda_speaker_events_get_volume());
+}
+
+static lv_obj_t *create_volume_button(
+    lv_obj_t *parent,
+    const char *label_text,
+    int width,
+    int height,
+    int x_offset,
+    int y_offset,
+    lv_event_cb_t callback)
+{
+    lv_obj_t *button = lv_button_create(parent);
+    lv_obj_set_size(button, width, height);
+    lv_obj_align(button, LV_ALIGN_CENTER, x_offset, y_offset);
+    lv_obj_set_style_radius(button, 20, 0);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0x222222), 0);
+    lv_obj_set_style_border_width(button, 2, 0);
+    lv_obj_set_style_border_color(button, lv_color_hex(0x00D5D5), 0);
+
+    /*
+     * Let press/release events bubble to volume_page so a swipe that starts
+     * on a button can still navigate normally.
+     */
+    lv_obj_add_flag(button, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    lv_obj_add_event_cb(
+        button,
+        callback,
+        LV_EVENT_CLICKED,
+        NULL);
+
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, label_text);
+    lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+    lv_obj_center(label);
+
+    return button;
+}
+
+static void create_volume_page(lv_obj_t *screen)
+{
+    volume_page = lv_obj_create(screen);
+    lv_obj_set_size(volume_page, 466, 466);
+    lv_obj_center(volume_page);
+    lv_obj_set_style_bg_color(volume_page, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(volume_page, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(volume_page, 0, 0);
+    lv_obj_set_style_pad_all(volume_page, 0, 0);
+    lv_obj_set_style_radius(volume_page, 0, 0);
+    lv_obj_clear_flag(volume_page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(volume_page, LV_OBJ_FLAG_CLICKABLE);
+
+    /* Same confirmed physical orientation as Face/Battery/Wi-Fi. */
+    lv_obj_set_style_transform_pivot_x(volume_page, 233, 0);
+    lv_obj_set_style_transform_pivot_y(volume_page, 233, 0);
+    lv_obj_set_style_transform_rotation(volume_page, 900, 0);
+
+    lv_obj_t *title = lv_label_create(volume_page);
+    lv_label_set_text(title, "VOLUME");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 72);
+
+    lv_obj_t *sound_label = lv_label_create(volume_page);
+    lv_label_set_text(sound_label, "SOUND");
+    lv_obj_set_style_text_color(sound_label, lv_color_hex(0x00D5D5), 0);
+    lv_obj_set_style_text_font(sound_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(sound_label, LV_ALIGN_CENTER, 0, -86);
+
+    volume_percent_label = lv_label_create(volume_page);
+    lv_label_set_text(volume_percent_label, "25%");
+    lv_obj_set_style_text_color(
+        volume_percent_label,
+        lv_color_hex(0xFFFFFF),
+        0);
+    lv_obj_set_style_text_font(
+        volume_percent_label,
+        &lv_font_montserrat_14,
+        0);
+    lv_obj_align(
+        volume_percent_label,
+        LV_ALIGN_CENTER,
+        0,
+        -46);
+
+    create_volume_button(
+        volume_page,
+        "-",
+        100,
+        70,
+        -75,
+        18,
+        volume_minus_button_cb);
+
+    create_volume_button(
+        volume_page,
+        "+",
+        100,
+        70,
+        75,
+        18,
+        volume_plus_button_cb);
+
+    create_volume_button(
+        volume_page,
+        "TEST",
+        190,
+        62,
+        0,
+        106,
+        volume_test_button_cb);
+
+    volume_status_label = lv_label_create(volume_page);
+    lv_label_set_text(volume_status_label, "SPEAKER");
+    lv_obj_set_style_text_color(
+        volume_status_label,
+        lv_color_hex(0x00D5D5),
+        0);
+    lv_obj_set_style_text_font(
+        volume_status_label,
+        &lv_font_montserrat_14,
+        0);
+    lv_obj_align(
+        volume_status_label,
+        LV_ALIGN_CENTER,
+        0,
+        156);
+
+    /*
+     * While Volume is visible, this page is moved above the transparent
+     * swipe layer. Therefore it must own swipe input itself.
+     */
+    lv_obj_add_event_cb(volume_page, swipe_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(volume_page, swipe_event_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(volume_page, swipe_event_cb, LV_EVENT_PRESS_LOST, NULL);
+
+    update_volume_ui_locked();
+
+    lv_obj_add_flag(volume_page, LV_OBJ_FLAG_HIDDEN);
+}
+
 /* Called only from an LVGL event callback, so do not take the BSP LVGL lock here. */
 static void set_page_from_lvgl(koyoda_page_t page)
 {
@@ -611,6 +858,7 @@ static void set_page_from_lvgl(koyoda_page_t page)
     lv_obj_add_flag(face_img, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(wifi_page, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(volume_page, LV_OBJ_FLAG_HIDDEN);
 
     if (page == PAGE_FACE)
     {
@@ -630,6 +878,26 @@ static void set_page_from_lvgl(koyoda_page_t page)
         wifi_refresh_requested = true;
         ESP_LOGI(TAG, "Page -> WIFI");
     }
+    else if (page == PAGE_VOLUME)
+    {
+        lv_obj_clear_flag(volume_page, LV_OBJ_FLAG_HIDDEN);
+        update_volume_ui_locked();
+
+        /*
+         * Put the interactive Volume page above the transparent global
+         * swipe layer so its - / + / TEST buttons receive touch.
+         */
+        lv_obj_move_foreground(volume_page);
+
+        ESP_LOGI(TAG, "Page -> VOLUME");
+        return;
+    }
+
+    /*
+     * On Face/Battery/Wi-Fi the existing transparent layer stays on top
+     * and owns swipe navigation exactly as before.
+     */
+    lv_obj_move_foreground(swipe_layer);
 }
 
 static void navigate_next_from_lvgl(void)
@@ -1078,12 +1346,13 @@ void app_main(void)
 
     create_battery_page(screen);
     create_wifi_page(screen);
+    create_volume_page(screen);
     create_swipe_layer(screen);
     anim_reset(&animation, lv_tick_get());
 
     bsp_display_unlock();
 
-    ESP_LOGI(TAG, "KOYODA UI ready: Face <-> Battery <-> Wi-Fi");
+    ESP_LOGI(TAG, "KOYODA UI ready: Face <-> Battery <-> Wi-Fi <-> Volume");
 
     /*
      * Wi-Fi Clean Step 1:
