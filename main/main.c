@@ -1099,19 +1099,14 @@ void app_main(void)
     }
 
     /*
-     * Microphone Probe Step 1:
-     * ES7210 capture runs in its own low-priority task and writes ONLY
-     * to Serial.  It does not touch LVGL, face animation, page state,
-     * charging animation, Wi-Fi UI, or touch.
+     * SPEAKER SOLO DIAGNOSTIC:
+     * Temporarily do NOT start the ES7210 mic.
+     *
+     * We are isolating whether ES8311 speaker init alone is stable with
+     * Display + Wi-Fi.  The microphone code is kept in the project and
+     * will be restored immediately after this test.
      */
-    esp_err_t mic_err = koyoda_mic_probe_start();
-    if (mic_err != ESP_OK)
-    {
-        ESP_LOGE(
-            TAG,
-            "Mic probe start failed: %s; KOYODA continues normally",
-            esp_err_to_name(mic_err));
-    }
+    ESP_LOGW(TAG, "Speaker solo diagnostic: microphone start temporarily skipped");
 
     /*
      * Speaker Probe Step 1:
