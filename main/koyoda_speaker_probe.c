@@ -14,28 +14,23 @@
 static const char *TAG = "KOYODA_SPK";
 
 /*
- * SPEAKER SOLO DIAGNOSTIC
+ * KOYODA Speaker Solo Diagnostic v2
  *
- * IMPORTANT:
- *   The microphone is intentionally NOT running in this build.
+ * Mic is intentionally OFF in this build.
  *
- * Goal:
- *   Test only:
- *       Display + Wi-Fi + ES8311 speaker
- *
- * If this is stable, the previous freeze is specifically caused by
- * running/initializing Mic + Speaker together, not by the speaker hardware
- * itself.
+ * This version repeats the speaker test forever so Serial Monitor can be
+ * opened at any time without missing the startup messages.
  */
 
-#define KOYODA_SPK_SAMPLE_RATE_HZ    22050
-#define KOYODA_SPK_CHUNK_SAMPLES       128
-#define KOYODA_SPK_VOLUME_PERCENT        18
-#define KOYODA_SPK_TONE_HZ              660
-#define KOYODA_SPK_TONE_MS              120
-#define KOYODA_SPK_GAP_MS               250
-#define KOYODA_SPK_BEEP_COUNT             3
-#define KOYODA_SPK_START_DELAY_MS       5000
+#define KOYODA_SPK_SAMPLE_RATE_HZ     22050
+#define KOYODA_SPK_CHUNK_SAMPLES        128
+#define KOYODA_SPK_VOLUME_PERCENT         35
+#define KOYODA_SPK_TONE_HZ               660
+#define KOYODA_SPK_TONE_MS               180
+#define KOYODA_SPK_GAP_MS                220
+#define KOYODA_SPK_BEEP_COUNT              3
+#define KOYODA_SPK_START_DELAY_MS        5000
+#define KOYODA_SPK_REPEAT_DELAY_MS       5000
 
 static volatile bool s_started = false;
 static volatile bool s_finished = false;
@@ -57,25 +52,20 @@ static void fill_square_tone(
     size_t count,
     uint32_t *phase)
 {
-    uint32_t period =
-        KOYODA_SPK_SAMPLE_RATE_HZ / KOYODA_SPK_TONE_HZ;
-
+    uint32_t period = KOYODA_SPK_SAMPLE_RATE_HZ / KOYODA_SPK_TONE_HZ;
     if (period < 2)
     {
         period = 2;
     }
 
-    /* Quieter than the first probe on purpose. */
-    const int16_t amplitude = 3000;
+    const int16_t amplitude = 5000;
 
     for (size_t i = 0; i < count; ++i)
     {
         uint32_t p = (*phase) % period;
-        samples[i] =
-            (p < (period / 2U))
-                ? amplitude
-                : (int16_t)-amplitude;
-
+        samples[i] = (p < (period / 2U))
+                         ? amplitude
+                         : (int16_t)-amplitude;
         (*phase)++;
     }
 }
@@ -116,10 +106,6 @@ static bool play_tone(
         }
 
         sent += chunk;
-
-        /*
-         * Yield between tiny writes so the display task is never starved.
-         */
         taskYIELD();
     }
 
@@ -132,12 +118,9 @@ static void speaker_probe_task(void *arg)
 
     ESP_LOGW(
         TAG,
-        "SOLO TEST: mic is OFF; waiting %u ms before speaker init",
+        "SOLO v2: mic is OFF; waiting %u ms before speaker init",
         (unsigned)KOYODA_SPK_START_DELAY_MS);
 
-    /*
-     * Let LVGL, Wi-Fi, battery and animation settle first.
-     */
     vTaskDelay(pdMS_TO_TICKS(KOYODA_SPK_START_DELAY_MS));
 
     log_memory("before speaker init");
@@ -193,35 +176,55 @@ static void speaker_probe_task(void *arg)
         "SPEAKER READY: 22050 Hz / 16-bit / mono / volume=%d%%",
         KOYODA_SPK_VOLUME_PERCENT);
 
-    for (int i = 0; i < KOYODA_SPK_BEEP_COUNT; ++i)
-    {
-        ESP_LOGI(
-            TAG,
-            "BEEP %d/%d",
-            i + 1,
-            KOYODA_SPK_BEEP_COUNT);
+    unsigned cycle = 1;
 
-        if (!play_tone(speaker, KOYODA_SPK_TONE_MS))
+    while (1)
+    {
+        ESP_LOGI(TAG, "=== SPEAKER TEST CYCLE %u ===", cycle);
+
+        bool ok = true;
+
+        for (int i = 0; i < KOYODA_SPK_BEEP_COUNT; ++i)
         {
-            break;
+            ESP_LOGI(
+                TAG,
+                "BEEP %d/%d",
+                i + 1,
+                KOYODA_SPK_BEEP_COUNT);
+
+            if (!play_tone(speaker, KOYODA_SPK_TONE_MS))
+            {
+                ok = false;
+                break;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(KOYODA_SPK_GAP_MS));
         }
 
-        vTaskDelay(pdMS_TO_TICKS(KOYODA_SPK_GAP_MS));
+        log_memory("after beep cycle");
+
+        if (ok)
+        {
+            ESP_LOGI(
+                TAG,
+                "Cycle %u complete; repeating in %u ms",
+                cycle,
+                (unsigned)KOYODA_SPK_REPEAT_DELAY_MS);
+        }
+        else
+        {
+            ESP_LOGE(
+                TAG,
+                "Cycle %u failed; repeating in %u ms",
+                cycle,
+                (unsigned)KOYODA_SPK_REPEAT_DELAY_MS);
+        }
+
+        s_finished = true;
+        cycle++;
+
+        vTaskDelay(pdMS_TO_TICKS(KOYODA_SPK_REPEAT_DELAY_MS));
     }
-
-    ret = esp_codec_dev_close(speaker);
-
-    if (ret != ESP_CODEC_DEV_OK)
-    {
-        ESP_LOGW(TAG, "esp_codec_dev_close returned: %d", ret);
-    }
-
-    log_memory("after speaker close");
-
-    ESP_LOGI(TAG, "SPEAKER SOLO TEST COMPLETE");
-    s_finished = true;
-
-    vTaskDelete(NULL);
 }
 
 esp_err_t koyoda_speaker_probe_start(void)
@@ -247,7 +250,7 @@ esp_err_t koyoda_speaker_probe_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "Speaker solo probe scheduled");
+    ESP_LOGI(TAG, "Speaker solo v2 probe scheduled");
     return ESP_OK;
 }
 
