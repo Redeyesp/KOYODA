@@ -16,8 +16,7 @@
 #include "pmu_bridge.h"
 #include "koyoda_animation.h"
 #include "koyoda_wifi.h"
-#include "koyoda_mic_probe.h"
-#include "koyoda_speaker_events.h"
+#include "koyoda_audio_duplex.h"
 
 LV_IMAGE_DECLARE(koyoda_idle);
 LV_IMAGE_DECLARE(koyoda_half);
@@ -276,7 +275,7 @@ static void battery_status_task(void *arg)
                     if (stable_vbus)
                     {
                         request_charging_animation();
-                        koyoda_speaker_events_beep_charge();
+                        koyoda_audio_duplex_beep_charge();
                         ESP_LOGI(TAG, "Stable VBUS inserted");
                     }
                     else
@@ -617,7 +616,7 @@ static void update_volume_ui_locked(void)
         return;
     }
 
-    int volume = koyoda_speaker_events_get_volume();
+    int volume = koyoda_audio_duplex_get_volume();
 
     char text[16];
     snprintf(text, sizeof(text), "%d%%", volume);
@@ -648,13 +647,13 @@ static void volume_minus_button_cb(lv_event_t *e)
         return;
     }
 
-    int volume = koyoda_speaker_events_get_volume() - KOYODA_VOLUME_STEP;
+    int volume = koyoda_audio_duplex_get_volume() - KOYODA_VOLUME_STEP;
     if (volume < 0)
     {
         volume = 0;
     }
 
-    koyoda_speaker_events_set_volume(volume);
+    koyoda_audio_duplex_set_volume(volume);
     update_volume_ui_locked();
 
     ESP_LOGI(TAG, "Volume -> %d%%", volume);
@@ -667,13 +666,13 @@ static void volume_plus_button_cb(lv_event_t *e)
         return;
     }
 
-    int volume = koyoda_speaker_events_get_volume() + KOYODA_VOLUME_STEP;
+    int volume = koyoda_audio_duplex_get_volume() + KOYODA_VOLUME_STEP;
     if (volume > 100)
     {
         volume = 100;
     }
 
-    koyoda_speaker_events_set_volume(volume);
+    koyoda_audio_duplex_set_volume(volume);
     update_volume_ui_locked();
 
     ESP_LOGI(TAG, "Volume -> %d%%", volume);
@@ -686,11 +685,11 @@ static void volume_test_button_cb(lv_event_t *e)
         return;
     }
 
-    koyoda_speaker_events_beep_test();
+    koyoda_audio_duplex_beep_test();
     ESP_LOGI(
         TAG,
         "Volume test requested at %d%%",
-        koyoda_speaker_events_get_volume());
+        koyoda_audio_duplex_get_volume());
 }
 
 static lv_obj_t *create_volume_button(
@@ -1278,9 +1277,8 @@ void app_main(void)
     /*
      * Keep the esp_lvgl_adapter render task on CPU0.
      *
-     * KOYODA's microphone probe is pinned to CPU1, so this makes the
-     * display/LVGL side deterministic instead of leaving the adapter task
-     * with no core affinity.
+     * KOYODA's shared audio owner runs on CPU1, so this keeps the
+     * display/LVGL side deterministic on CPU0.
      *
      * All other Waveshare BSP defaults are preserved exactly:
      *   rotation        = 0
@@ -1369,29 +1367,23 @@ void app_main(void)
     }
 
     /*
-     * SPEAKER SOLO DIAGNOSTIC:
-     * Temporarily do NOT start the ES7210 mic.
+     * Shared Audio Step 1:
      *
-     * We are isolating whether ES8311 speaker init alone is stable with
-     * Display + Wi-Fi.  The microphone code is kept in the project and
-     * will be restored immediately after this test.
-     */
-    ESP_LOGW(TAG, "Speaker solo diagnostic: microphone start temporarily skipped");
-
-    /*
-     * Speaker Events:
-     * one short beep after boot, then completely silent unless
-     * a new stable USB/VBUS insertion event requests another beep.
+     * ONE owner initializes the BSP duplex I2S path exactly once, then opens
+     * both ES7210 microphone and ES8311 speaker with the same
+     * 22050 Hz / 16-bit / mono format.
      *
-     * There is NO repeating timer in this module.
+     * Mic capture and beep playback are serialized by that one audio task.
+     * This avoids the previous Mic/Speaker init collision while keeping both
+     * codec handles open and ready.
      */
-    esp_err_t speaker_err = koyoda_speaker_events_start();
-    if (speaker_err != ESP_OK)
+    esp_err_t audio_err = koyoda_audio_duplex_start();
+    if (audio_err != ESP_OK)
     {
         ESP_LOGE(
             TAG,
-            "Speaker events start failed: %s; KOYODA continues normally",
-            esp_err_to_name(speaker_err));
+            "Shared audio start failed: %s; KOYODA continues without audio",
+            esp_err_to_name(audio_err));
     }
 
     xTaskCreate(
