@@ -1065,21 +1065,6 @@ void app_main(void)
             esp_err_to_name(wifi_err));
     }
 
-    /*
-     * Microphone Probe Step 1:
-     * ES7210 capture runs in its own low-priority task and writes ONLY
-     * to Serial.  It does not touch LVGL, face animation, page state,
-     * charging animation, Wi-Fi UI, or touch.
-     */
-    esp_err_t mic_err = koyoda_mic_probe_start();
-    if (mic_err != ESP_OK)
-    {
-        ESP_LOGE(
-            TAG,
-            "Mic probe start failed: %s; KOYODA continues normally",
-            esp_err_to_name(mic_err));
-    }
-
     xTaskCreate(
         power_button_task,
         "power_button",
@@ -1095,6 +1080,21 @@ void app_main(void)
         NULL,
         4,
         NULL);
+
+
+    /*
+     * Microphone Safe Probe v2:
+     * core UI/power/battery tasks are already running before audio starts.
+     * The mic task itself waits 8 seconds before touching I2S/ES7210.
+     */
+    esp_err_t mic_err = koyoda_mic_probe_start();
+    if (mic_err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Mic probe start failed: %s; KOYODA continues normally",
+            esp_err_to_name(mic_err));
+    }
 
     /*
      * No fake boot animation here.
