@@ -17,6 +17,7 @@
 #include "koyoda_animation.h"
 #include "koyoda_wifi.h"
 #include "koyoda_mic_probe.h"
+#include "koyoda_speaker_probe.h"
 
 LV_IMAGE_DECLARE(koyoda_idle);
 LV_IMAGE_DECLARE(koyoda_half);
@@ -1111,7 +1112,7 @@ void app_main(void)
             "Mic probe start failed: %s; KOYODA continues normally",
             esp_err_to_name(mic_err));
     }
-
+    
     xTaskCreate(
         power_button_task,
         "power_button",
