@@ -1005,7 +1005,39 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Starting KOYODA Face + Swipe Battery Page");
 
-    bsp_display_start();
+    /*
+     * Keep the esp_lvgl_adapter render task on CPU0.
+     *
+     * KOYODA's microphone probe is pinned to CPU1, so this makes the
+     * display/LVGL side deterministic instead of leaving the adapter task
+     * with no core affinity.
+     *
+     * All other Waveshare BSP defaults are preserved exactly:
+     *   rotation        = 0
+     *   tear avoidance  = none
+     *   touch swap_xy   = 0
+     *   touch mirror_x  = 1
+     *   touch mirror_y  = 1
+     */
+    bsp_display_cfg_t display_cfg = {
+        .lv_adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG(),
+        .rotation = ESP_LV_ADAPTER_ROTATE_0,
+        .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_NONE,
+        .touch_flags = {
+            .swap_xy = 0,
+            .mirror_x = 1,
+            .mirror_y = 1,
+        },
+    };
+
+    display_cfg.lv_adapter_cfg.task_core_id = 0;
+
+    ESP_LOGI(TAG, "Starting LVGL adapter pinned to CPU0");
+    if (bsp_display_start_with_config(&display_cfg) == NULL)
+    {
+        ESP_LOGE(TAG, "Display/LVGL start failed");
+        return;
+    }
 
     if (pmu_bridge_init() != 0)
     {
@@ -1065,6 +1097,21 @@ void app_main(void)
             esp_err_to_name(wifi_err));
     }
 
+    /*
+     * Microphone Probe Step 1:
+     * ES7210 capture runs in its own low-priority task and writes ONLY
+     * to Serial.  It does not touch LVGL, face animation, page state,
+     * charging animation, Wi-Fi UI, or touch.
+     */
+    esp_err_t mic_err = koyoda_mic_probe_start();
+    if (mic_err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Mic probe start failed: %s; KOYODA continues normally",
+            esp_err_to_name(mic_err));
+    }
+
     xTaskCreate(
         power_button_task,
         "power_button",
@@ -1080,21 +1127,6 @@ void app_main(void)
         NULL,
         4,
         NULL);
-
-
-    /*
-     * Microphone Safe Probe v2:
-     * core UI/power/battery tasks are already running before audio starts.
-     * The mic task itself waits 8 seconds before touching I2S/ES7210.
-     */
-    esp_err_t mic_err = koyoda_mic_probe_start();
-    if (mic_err != ESP_OK)
-    {
-        ESP_LOGE(
-            TAG,
-            "Mic probe start failed: %s; KOYODA continues normally",
-            esp_err_to_name(mic_err));
-    }
 
     /*
      * No fake boot animation here.
