@@ -11,22 +11,25 @@
 #include "bsp/esp-bsp.h"
 
 /*
- * Waveshare ESP32-S3-Touch-AMOLED-1.75 audio wiring:
+ * KOYODA Microphone Probe Step 1
  *
- * ES7210 RX uses four TDM slots:
- *   slot 0 = MIC1 (front microphone)
- *   slot 1 = MIC3 (playback reference)
- *   slot 2 = MIC2 (front microphone)
- *   slot 3 = MIC4 (not connected)
+ * IMPORTANT:
+ * KOYODA is pinned to Waveshare BSP 3.0.1.
+ * The public BSP header used by the build exposes
+ * bsp_audio_codec_microphone_init(), but not bsp_audio_init_voice_24k().
  *
- * For this first probe we inspect only slot 0 and slot 2.
+ * Therefore this probe deliberately uses the BSP's public/default
+ * microphone path first:
+ *   ES7210 -> standard I2S RX -> 22050 Hz / 16-bit / mono
+ *
+ * The goal of Step 1 is only to prove that real microphone samples change
+ * with sound without disturbing KOYODA's stable UI/animation/Wi-Fi.
  */
 
 static const char *TAG = "KOYODA_MIC";
 
-#define KOYODA_MIC_SAMPLE_RATE_HZ      24000
-#define KOYODA_MIC_TDM_CHANNELS        4
-#define KOYODA_MIC_FRAMES_PER_READ     240
+#define KOYODA_MIC_SAMPLE_RATE_HZ      22050
+#define KOYODA_MIC_SAMPLES_PER_READ    256
 #define KOYODA_MIC_START_DELAY_MS      3000
 #define KOYODA_MIC_REPORT_MS           300
 #define KOYODA_MIC_GAIN_DB             30.0f
@@ -43,8 +46,7 @@ static int32_t abs_sample(int16_t sample)
 static int level_to_percent(uint32_t level)
 {
     /*
-     * Diagnostic meter only; this is deliberately not calibrated SPL.
-     * 12000 average absolute sample value maps to 100%.
+     * Diagnostic meter only.  This is NOT calibrated SPL.
      */
     if (level >= 12000U)
     {
@@ -59,39 +61,24 @@ static void mic_probe_task(void *arg)
     (void)arg;
 
     /*
-     * Give display, animations, battery task and Wi-Fi time to reach
-     * their stable baseline before the audio peripheral is initialized.
+     * Let the already-stable display, animation, battery and Wi-Fi
+     * systems settle before audio starts.
      */
     vTaskDelay(pdMS_TO_TICKS(KOYODA_MIC_START_DELAY_MS));
 
     ESP_LOGI(TAG, "Initializing ES7210 microphone probe");
 
     /*
-     * The maintained Waveshare BSP uses:
-     * - 24 kHz
-     * - 16-bit
-     * - TX standard I2S
-     * - RX four-slot TDM
-     * - MCLK x256
+     * The BSP initializes its default audio/I2S path internally when
+     * the microphone codec is requested and audio has not been started yet.
      */
-    esp_err_t err = bsp_audio_init_voice_24k();
-
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(
-            TAG,
-            "bsp_audio_init_voice_24k failed: %s",
-            esp_err_to_name(err));
-        s_started = false;
-        vTaskDelete(NULL);
-        return;
-    }
-
     esp_codec_dev_handle_t mic = bsp_audio_codec_microphone_init();
 
     if (mic == NULL)
     {
-        ESP_LOGE(TAG, "bsp_audio_codec_microphone_init returned NULL");
+        ESP_LOGE(
+            TAG,
+            "bsp_audio_codec_microphone_init returned NULL");
         s_started = false;
         vTaskDelete(NULL);
         return;
@@ -99,10 +86,8 @@ static void mic_probe_task(void *arg)
 
     esp_codec_dev_sample_info_t format = {
         .sample_rate = KOYODA_MIC_SAMPLE_RATE_HZ,
-        .channel = KOYODA_MIC_TDM_CHANNELS,
+        .channel = 1,
         .bits_per_sample = 16,
-        .channel_mask = 0x0F,
-        .mclk_multiple = 256,
     };
 
     int codec_ret = esp_codec_dev_open(mic, &format);
@@ -118,7 +103,9 @@ static void mic_probe_task(void *arg)
         return;
     }
 
-    codec_ret = esp_codec_dev_set_in_gain(mic, KOYODA_MIC_GAIN_DB);
+    codec_ret = esp_codec_dev_set_in_gain(
+        mic,
+        KOYODA_MIC_GAIN_DB);
 
     if (codec_ret != ESP_CODEC_DEV_OK)
     {
@@ -131,19 +118,15 @@ static void mic_probe_task(void *arg)
 
     ESP_LOGI(
         TAG,
-        "MIC READY: ES7210 24kHz 16-bit 4-slot TDM; monitoring MIC1 + MIC2");
+        "MIC READY: ES7210 22050 Hz / 16-bit / mono");
 
     s_running = true;
 
-    int16_t samples[
-        KOYODA_MIC_FRAMES_PER_READ *
-        KOYODA_MIC_TDM_CHANNELS];
+    int16_t samples[KOYODA_MIC_SAMPLES_PER_READ];
 
-    uint64_t sum_mic1 = 0;
-    uint64_t sum_mic2 = 0;
+    uint64_t sum = 0;
     uint32_t count = 0;
-    uint32_t peak_mic1 = 0;
-    uint32_t peak_mic2 = 0;
+    uint32_t peak = 0;
 
     TickType_t last_report = xTaskGetTickCount();
 
@@ -156,65 +139,50 @@ static void mic_probe_task(void *arg)
 
         if (codec_ret != ESP_CODEC_DEV_OK)
         {
-            ESP_LOGE(TAG, "Microphone read failed: %d", codec_ret);
+            ESP_LOGE(
+                TAG,
+                "Microphone read failed: %d",
+                codec_ret);
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
-        for (size_t frame = 0;
-             frame < KOYODA_MIC_FRAMES_PER_READ;
-             ++frame)
+        for (size_t i = 0;
+             i < KOYODA_MIC_SAMPLES_PER_READ;
+             ++i)
         {
-            /*
-             * TDM order documented by the Waveshare BSP:
-             * MIC1, playback-ref, MIC2, unused.
-             */
-            uint32_t mic1 = (uint32_t)abs_sample(
-                samples[(frame * KOYODA_MIC_TDM_CHANNELS) + 0]);
+            uint32_t level =
+                (uint32_t)abs_sample(samples[i]);
 
-            uint32_t mic2 = (uint32_t)abs_sample(
-                samples[(frame * KOYODA_MIC_TDM_CHANNELS) + 2]);
-
-            sum_mic1 += mic1;
-            sum_mic2 += mic2;
+            sum += level;
             count++;
 
-            if (mic1 > peak_mic1)
+            if (level > peak)
             {
-                peak_mic1 = mic1;
-            }
-
-            if (mic2 > peak_mic2)
-            {
-                peak_mic2 = mic2;
+                peak = level;
             }
         }
 
         TickType_t now = xTaskGetTickCount();
 
-        if ((now - last_report) >= pdMS_TO_TICKS(KOYODA_MIC_REPORT_MS))
+        if ((now - last_report) >=
+            pdMS_TO_TICKS(KOYODA_MIC_REPORT_MS))
         {
-            uint32_t avg_mic1 =
-                (count > 0) ? (uint32_t)(sum_mic1 / count) : 0;
-
-            uint32_t avg_mic2 =
-                (count > 0) ? (uint32_t)(sum_mic2 / count) : 0;
+            uint32_t avg =
+                (count > 0)
+                    ? (uint32_t)(sum / count)
+                    : 0;
 
             ESP_LOGI(
                 TAG,
-                "MIC1 %3d%% avg=%5lu peak=%5lu | MIC2 %3d%% avg=%5lu peak=%5lu",
-                level_to_percent(avg_mic1),
-                (unsigned long)avg_mic1,
-                (unsigned long)peak_mic1,
-                level_to_percent(avg_mic2),
-                (unsigned long)avg_mic2,
-                (unsigned long)peak_mic2);
+                "MIC %3d%% avg=%5lu peak=%5lu",
+                level_to_percent(avg),
+                (unsigned long)avg,
+                (unsigned long)peak);
 
-            sum_mic1 = 0;
-            sum_mic2 = 0;
+            sum = 0;
             count = 0;
-            peak_mic1 = 0;
-            peak_mic2 = 0;
+            peak = 0;
             last_report = now;
         }
     }
