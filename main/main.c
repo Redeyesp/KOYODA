@@ -17,7 +17,7 @@
 #include "koyoda_animation.h"
 #include "koyoda_wifi.h"
 #include "koyoda_mic_probe.h"
-#include "koyoda_speaker_probe.h"
+#include "koyoda_speaker_events.h"
 
 LV_IMAGE_DECLARE(koyoda_idle);
 LV_IMAGE_DECLARE(koyoda_half);
@@ -267,7 +267,7 @@ static void battery_status_task(void *arg)
                     if (stable_vbus)
                     {
                         request_charging_animation();
-                        koyoda_speaker_request_beep();
+                        koyoda_speaker_events_beep_charge();
                         ESP_LOGI(TAG, "Stable VBUS inserted");
                     }
                     else
@@ -1110,18 +1110,18 @@ void app_main(void)
     ESP_LOGW(TAG, "Speaker solo diagnostic: microphone start temporarily skipped");
 
     /*
-     * Speaker Probe Step 1:
-     * waits until the ES7210 microphone is running, then plays
-     * three short beeps through ES8311.
+     * Speaker Events:
+     * one short beep after boot, then completely silent unless
+     * a new stable USB/VBUS insertion event requests another beep.
      *
-     * It does not touch LVGL, face animation, page state or Wi-Fi.
+     * There is NO repeating timer in this module.
      */
-    esp_err_t speaker_err = koyoda_speaker_probe_start();
+    esp_err_t speaker_err = koyoda_speaker_events_start();
     if (speaker_err != ESP_OK)
     {
         ESP_LOGE(
             TAG,
-            "Speaker probe start failed: %s; KOYODA continues normally",
+            "Speaker events start failed: %s; KOYODA continues normally",
             esp_err_to_name(speaker_err));
     }
 
