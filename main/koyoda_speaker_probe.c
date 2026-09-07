@@ -14,26 +14,28 @@
 static const char *TAG = "KOYODA_SPK";
 
 /*
- * KOYODA Speaker Solo Diagnostic v2
+ * KOYODA Speaker Solo v3
  *
- * Mic is intentionally OFF in this build.
+ * Mic remains intentionally OFF for this diagnostic baseline.
  *
- * This version repeats the speaker test forever so Serial Monitor can be
- * opened at any time without missing the startup messages.
+ * Sound policy:
+ *   - ONE short beep when KOYODA boots and speaker becomes ready
+ *   - ONE short beep when USB/VBUS is newly inserted
+ *   - NO repeating beep
  */
 
-#define KOYODA_SPK_SAMPLE_RATE_HZ     22050
-#define KOYODA_SPK_CHUNK_SAMPLES        128
-#define KOYODA_SPK_VOLUME_PERCENT         35
-#define KOYODA_SPK_TONE_HZ               660
-#define KOYODA_SPK_TONE_MS               180
-#define KOYODA_SPK_GAP_MS                220
-#define KOYODA_SPK_BEEP_COUNT              3
-#define KOYODA_SPK_START_DELAY_MS        5000
-#define KOYODA_SPK_REPEAT_DELAY_MS       5000
+#define KOYODA_SPK_SAMPLE_RATE_HZ      22050
+#define KOYODA_SPK_CHUNK_SAMPLES         128
+#define KOYODA_SPK_VOLUME_PERCENT          25
+#define KOYODA_SPK_TONE_HZ                660
+#define KOYODA_SPK_TONE_MS                120
+#define KOYODA_SPK_START_DELAY_MS         3000
 
 static volatile bool s_started = false;
 static volatile bool s_finished = false;
+static volatile bool s_beep_pending = false;
+
+static esp_codec_dev_handle_t s_speaker = NULL;
 
 static void log_memory(const char *where)
 {
@@ -58,7 +60,7 @@ static void fill_square_tone(
         period = 2;
     }
 
-    const int16_t amplitude = 5000;
+    const int16_t amplitude = 3500;
 
     for (size_t i = 0; i < count; ++i)
     {
@@ -70,15 +72,18 @@ static void fill_square_tone(
     }
 }
 
-static bool play_tone(
-    esp_codec_dev_handle_t speaker,
-    uint32_t duration_ms)
+static bool play_beep(void)
 {
+    if (s_speaker == NULL)
+    {
+        return false;
+    }
+
     int16_t samples[KOYODA_SPK_CHUNK_SAMPLES];
     uint32_t phase = 0;
 
     const uint32_t total_samples =
-        (KOYODA_SPK_SAMPLE_RATE_HZ * duration_ms) / 1000U;
+        (KOYODA_SPK_SAMPLE_RATE_HZ * KOYODA_SPK_TONE_MS) / 1000U;
 
     uint32_t sent = 0;
 
@@ -95,7 +100,7 @@ static bool play_tone(
         fill_square_tone(samples, chunk, &phase);
 
         int ret = esp_codec_dev_write(
-            speaker,
+            s_speaker,
             samples,
             chunk * sizeof(int16_t));
 
@@ -116,30 +121,23 @@ static void speaker_probe_task(void *arg)
 {
     (void)arg;
 
-    ESP_LOGW(
+    ESP_LOGI(
         TAG,
-        "SOLO v2: mic is OFF; waiting %u ms before speaker init",
-        (unsigned)KOYODA_SPK_START_DELAY_MS);
+        "Speaker v3: one boot beep + charge-insertion beep only");
 
     vTaskDelay(pdMS_TO_TICKS(KOYODA_SPK_START_DELAY_MS));
 
     log_memory("before speaker init");
 
-    ESP_LOGI(TAG, "Calling bsp_audio_codec_speaker_init()");
+    s_speaker = bsp_audio_codec_speaker_init();
 
-    esp_codec_dev_handle_t speaker =
-        bsp_audio_codec_speaker_init();
-
-    if (speaker == NULL)
+    if (s_speaker == NULL)
     {
         ESP_LOGE(TAG, "bsp_audio_codec_speaker_init returned NULL");
-        log_memory("speaker init failed");
         s_started = false;
         vTaskDelete(NULL);
         return;
     }
-
-    log_memory("after speaker init");
 
     esp_codec_dev_sample_info_t format = {
         .sample_rate = KOYODA_SPK_SAMPLE_RATE_HZ,
@@ -147,23 +145,19 @@ static void speaker_probe_task(void *arg)
         .bits_per_sample = 16,
     };
 
-    ESP_LOGI(TAG, "Opening ES8311 codec");
-
-    int ret = esp_codec_dev_open(speaker, &format);
+    int ret = esp_codec_dev_open(s_speaker, &format);
 
     if (ret != ESP_CODEC_DEV_OK)
     {
         ESP_LOGE(TAG, "esp_codec_dev_open failed: %d", ret);
-        log_memory("speaker open failed");
+        s_speaker = NULL;
         s_started = false;
         vTaskDelete(NULL);
         return;
     }
 
-    log_memory("after speaker open");
-
     ret = esp_codec_dev_set_out_vol(
-        speaker,
+        s_speaker,
         KOYODA_SPK_VOLUME_PERCENT);
 
     if (ret != ESP_CODEC_DEV_OK)
@@ -173,57 +167,28 @@ static void speaker_probe_task(void *arg)
 
     ESP_LOGI(
         TAG,
-        "SPEAKER READY: 22050 Hz / 16-bit / mono / volume=%d%%",
+        "SPEAKER READY: volume=%d%%",
         KOYODA_SPK_VOLUME_PERCENT);
 
-    unsigned cycle = 1;
+    /* One short boot confirmation beep. */
+    ESP_LOGI(TAG, "BOOT BEEP");
+    play_beep();
+    s_finished = true;
 
+    /*
+     * Stay alive quietly and service event beeps only.
+     * There is intentionally no repeating sound.
+     */
     while (1)
     {
-        ESP_LOGI(TAG, "=== SPEAKER TEST CYCLE %u ===", cycle);
-
-        bool ok = true;
-
-        for (int i = 0; i < KOYODA_SPK_BEEP_COUNT; ++i)
+        if (s_beep_pending)
         {
-            ESP_LOGI(
-                TAG,
-                "BEEP %d/%d",
-                i + 1,
-                KOYODA_SPK_BEEP_COUNT);
-
-            if (!play_tone(speaker, KOYODA_SPK_TONE_MS))
-            {
-                ok = false;
-                break;
-            }
-
-            vTaskDelay(pdMS_TO_TICKS(KOYODA_SPK_GAP_MS));
+            s_beep_pending = false;
+            ESP_LOGI(TAG, "EVENT BEEP");
+            play_beep();
         }
 
-        log_memory("after beep cycle");
-
-        if (ok)
-        {
-            ESP_LOGI(
-                TAG,
-                "Cycle %u complete; repeating in %u ms",
-                cycle,
-                (unsigned)KOYODA_SPK_REPEAT_DELAY_MS);
-        }
-        else
-        {
-            ESP_LOGE(
-                TAG,
-                "Cycle %u failed; repeating in %u ms",
-                cycle,
-                (unsigned)KOYODA_SPK_REPEAT_DELAY_MS);
-        }
-
-        s_finished = true;
-        cycle++;
-
-        vTaskDelay(pdMS_TO_TICKS(KOYODA_SPK_REPEAT_DELAY_MS));
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -250,8 +215,13 @@ esp_err_t koyoda_speaker_probe_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "Speaker solo v2 probe scheduled");
+    ESP_LOGI(TAG, "Speaker v3 scheduled");
     return ESP_OK;
+}
+
+void koyoda_speaker_request_beep(void)
+{
+    s_beep_pending = true;
 }
 
 bool koyoda_speaker_probe_is_finished(void)

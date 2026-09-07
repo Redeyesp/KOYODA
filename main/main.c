@@ -267,6 +267,7 @@ static void battery_status_task(void *arg)
                     if (stable_vbus)
                     {
                         request_charging_animation();
+                        koyoda_speaker_request_beep();
                         ESP_LOGI(TAG, "Stable VBUS inserted");
                     }
                     else
