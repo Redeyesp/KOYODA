@@ -16,6 +16,7 @@ idf_component_register(
          "fun_happy.c"
          "koyoda_wifi.c"
          "koyoda_mic_probe.c"
+         "koyoda_speaker_probe.c"
     INCLUDE_DIRS "."
     REQUIRES
          XPowersLib
