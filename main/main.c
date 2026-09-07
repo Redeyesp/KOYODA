@@ -1112,7 +1112,23 @@ void app_main(void)
             "Mic probe start failed: %s; KOYODA continues normally",
             esp_err_to_name(mic_err));
     }
-    
+
+    /*
+     * Speaker Probe Step 1:
+     * waits until the ES7210 microphone is running, then plays
+     * three short beeps through ES8311.
+     *
+     * It does not touch LVGL, face animation, page state or Wi-Fi.
+     */
+    esp_err_t speaker_err = koyoda_speaker_probe_start();
+    if (speaker_err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Speaker probe start failed: %s; KOYODA continues normally",
+            esp_err_to_name(speaker_err));
+    }
+
     xTaskCreate(
         power_button_task,
         "power_button",
