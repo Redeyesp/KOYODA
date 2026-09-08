@@ -55,6 +55,34 @@ static const char *TAG = "KOYODA_AUDIO";
 #define AUDIO_TASK_PRIORITY                 2
 #define AUDIO_TASK_CORE                     1
 
+/* =========================================================
+ * VAD Step 1
+ *
+ * Lightweight energy-based VAD. No extra task, no AI, no network streaming.
+ *
+ * Start:
+ *   several consecutive frames must exceed the adaptive threshold.
+ *
+ * End:
+ *   speech must remain below threshold for ~850 ms.
+ *
+ * The noise floor adapts only while idle, so normal room noise does not
+ * continually lift the threshold during speech.
+ * ========================================================= */
+#define VAD_START_CONSECUTIVE_FRAMES         3
+#define VAD_END_SILENCE_MS                 850
+#define VAD_POST_BEEP_IGNORE_MS            250
+
+/* Absolute safety floor for a quiet room. */
+#define VAD_MIN_START_LEVEL                  70U
+
+/* Adaptive threshold = noise_floor * 3 + margin. */
+#define VAD_NOISE_MULTIPLIER                  3U
+#define VAD_NOISE_MARGIN                     30U
+
+/* Noise-floor IIR: 31/32 old + 1/32 new. */
+#define VAD_NOISE_FILTER_SHIFT                5U
+
 #define AUDIO_EVT_CHARGE_BEEP       (1UL << 0)
 #define AUDIO_EVT_TEST_BEEP         (1UL << 1)
 #define AUDIO_EVT_VOLUME_CHANGE     (1UL << 2)
@@ -70,6 +98,14 @@ static esp_codec_dev_handle_t s_speaker = NULL;
 static volatile bool s_ready = false;
 static volatile bool s_mic_running = false;
 static volatile int s_volume_percent = DEFAULT_VOLUME_PERCENT;
+
+/* VAD state. */
+static volatile bool s_vad_speaking = false;
+static uint32_t s_vad_noise_floor = 20U;
+static unsigned s_vad_start_counter = 0U;
+static TickType_t s_vad_last_voice_tick = 0;
+static TickType_t s_vad_voice_start_tick = 0;
+static TickType_t s_vad_ignore_until_tick = 0;
 
 static int clamp_volume(int percent)
 {
@@ -100,6 +136,146 @@ static int level_to_percent(uint32_t level)
     }
 
     return (int)((level * 100U) / 12000U);
+}
+
+static uint32_t vad_threshold(void)
+{
+    uint32_t threshold =
+        (s_vad_noise_floor * VAD_NOISE_MULTIPLIER) +
+        VAD_NOISE_MARGIN;
+
+    if (threshold < VAD_MIN_START_LEVEL)
+    {
+        threshold = VAD_MIN_START_LEVEL;
+    }
+
+    return threshold;
+}
+
+static bool tick_before(TickType_t a, TickType_t b)
+{
+    /*
+     * FreeRTOS ticks wrap. Signed subtraction keeps short relative comparisons
+     * correct across wraparound.
+     */
+    return ((int32_t)(a - b)) < 0;
+}
+
+static void vad_reset_after_beep(void)
+{
+    TickType_t now = xTaskGetTickCount();
+
+    s_vad_start_counter = 0U;
+    s_vad_last_voice_tick = now;
+    s_vad_ignore_until_tick =
+        now + pdMS_TO_TICKS(VAD_POST_BEEP_IGNORE_MS);
+
+    /*
+     * If a beep happened while speech was active, end that VAD segment here
+     * rather than letting the speaker tone become part of the user's speech.
+     */
+    if (s_vad_speaking)
+    {
+        uint32_t duration_ms =
+            (uint32_t)((now - s_vad_voice_start_tick) * portTICK_PERIOD_MS);
+
+        s_vad_speaking = false;
+
+        ESP_LOGI(
+            TAG,
+            "VAD VOICE END duration=%lums reason=speaker",
+            (unsigned long)duration_ms);
+    }
+}
+
+static void vad_process_frame(
+    uint32_t frame_avg,
+    uint32_t frame_peak)
+{
+    TickType_t now = xTaskGetTickCount();
+
+    if (tick_before(now, s_vad_ignore_until_tick))
+    {
+        return;
+    }
+
+    const uint32_t threshold = vad_threshold();
+
+    /*
+     * Use average energy as the primary signal. Peak is kept only for
+     * diagnostics and does not by itself trigger speech, which avoids clicks
+     * and one-sample spikes creating false starts.
+     */
+    const bool above = frame_avg >= threshold;
+
+    if (!s_vad_speaking)
+    {
+        /*
+         * Adapt room noise only while idle and only from frames that are below
+         * the current speech threshold.
+         */
+        if (!above)
+        {
+            s_vad_noise_floor =
+                ((s_vad_noise_floor * ((1U << VAD_NOISE_FILTER_SHIFT) - 1U)) +
+                 frame_avg) >>
+                VAD_NOISE_FILTER_SHIFT;
+
+            if (s_vad_noise_floor < 5U)
+            {
+                s_vad_noise_floor = 5U;
+            }
+
+            s_vad_start_counter = 0U;
+        }
+        else
+        {
+            s_vad_start_counter++;
+
+            if (s_vad_start_counter >= VAD_START_CONSECUTIVE_FRAMES)
+            {
+                s_vad_speaking = true;
+                s_vad_voice_start_tick = now;
+                s_vad_last_voice_tick = now;
+                s_vad_start_counter = 0U;
+
+                ESP_LOGI(
+                    TAG,
+                    "VAD VOICE START avg=%lu peak=%lu threshold=%lu noise=%lu",
+                    (unsigned long)frame_avg,
+                    (unsigned long)frame_peak,
+                    (unsigned long)threshold,
+                    (unsigned long)s_vad_noise_floor);
+            }
+        }
+
+        return;
+    }
+
+    if (above)
+    {
+        s_vad_last_voice_tick = now;
+        return;
+    }
+
+    const uint32_t silence_ms =
+        (uint32_t)((now - s_vad_last_voice_tick) * portTICK_PERIOD_MS);
+
+    if (silence_ms >= VAD_END_SILENCE_MS)
+    {
+        const uint32_t duration_ms =
+            (uint32_t)((now - s_vad_voice_start_tick) * portTICK_PERIOD_MS);
+
+        s_vad_speaking = false;
+        s_vad_start_counter = 0U;
+
+        ESP_LOGI(
+            TAG,
+            "VAD VOICE END duration=%lums noise=%lu threshold=%lu",
+            (unsigned long)duration_ms,
+            (unsigned long)s_vad_noise_floor,
+            (unsigned long)threshold);
+    }
 }
 
 static void log_memory(const char *where)
@@ -456,6 +632,7 @@ static void service_events(uint32_t events)
             BEEP_TONE_MS);
 
         play_one_beep();
+        vad_reset_after_beep();
     }
 
     if (events & AUDIO_EVT_TEST_BEEP)
@@ -467,6 +644,7 @@ static void service_events(uint32_t events)
             BEEP_TONE_MS);
 
         play_one_beep();
+        vad_reset_after_beep();
     }
 }
 
@@ -507,6 +685,7 @@ static void audio_owner_task(void *arg)
         (int)s_volume_percent);
 
     play_one_beep();
+    vad_reset_after_beep();
 
     int16_t samples[MIC_SAMPLES_PER_READ];
 
@@ -522,6 +701,12 @@ static void audio_owner_task(void *arg)
     ESP_LOGI(
         TAG,
         "MIC RUNNING; ES7210 + ES8311 stay open together");
+
+    ESP_LOGI(
+        TAG,
+        "VAD READY: start=%u frames, end=%ums, adaptive noise floor",
+        (unsigned)VAD_START_CONSECUTIVE_FRAMES,
+        (unsigned)VAD_END_SILENCE_MS);
 
     while (1)
     {
@@ -559,6 +744,9 @@ static void audio_owner_task(void *arg)
             continue;
         }
 
+        uint64_t frame_sum = 0;
+        uint32_t frame_peak = 0;
+
         for (size_t i = 0;
              i < MIC_SAMPLES_PER_READ;
              ++i)
@@ -566,14 +754,28 @@ static void audio_owner_task(void *arg)
             uint32_t level =
                 (uint32_t)abs_sample(samples[i]);
 
+            frame_sum += level;
+
             sum += level;
             count++;
+
+            if (level > frame_peak)
+            {
+                frame_peak = level;
+            }
 
             if (level > peak)
             {
                 peak = level;
             }
         }
+
+        const uint32_t frame_avg =
+            (uint32_t)(frame_sum / MIC_SAMPLES_PER_READ);
+
+        vad_process_frame(
+            frame_avg,
+            frame_peak);
 
         /*
          * Keep the CPU1 task cooperative.
@@ -595,10 +797,13 @@ static void audio_owner_task(void *arg)
 
             ESP_LOGI(
                 TAG,
-                "MIC %3d%% avg=%5lu peak=%5lu",
+                "MIC %3d%% avg=%5lu peak=%5lu | VAD=%s noise=%lu th=%lu",
                 level_to_percent(avg),
                 (unsigned long)avg,
-                (unsigned long)peak);
+                (unsigned long)peak,
+                s_vad_speaking ? "VOICE" : "IDLE",
+                (unsigned long)s_vad_noise_floor,
+                (unsigned long)vad_threshold());
 
             sum = 0;
             count = 0;
@@ -644,6 +849,11 @@ bool koyoda_audio_duplex_is_ready(void)
 bool koyoda_audio_duplex_mic_is_running(void)
 {
     return s_mic_running;
+}
+
+bool koyoda_audio_duplex_vad_is_speaking(void)
+{
+    return s_vad_speaking;
 }
 
 void koyoda_audio_duplex_beep_charge(void)

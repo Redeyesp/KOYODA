@@ -23,6 +23,13 @@ esp_err_t koyoda_audio_duplex_start(void);
 bool koyoda_audio_duplex_is_ready(void);
 bool koyoda_audio_duplex_mic_is_running(void);
 
+/*
+ * VAD Step 1:
+ * true while KOYODA currently considers the user to be speaking.
+ * This is intentionally exposed now so the next streaming step can reuse it.
+ */
+bool koyoda_audio_duplex_vad_is_speaking(void);
+
 /* Quiet event beeps. */
 void koyoda_audio_duplex_beep_charge(void);
 void koyoda_audio_duplex_beep_test(void);
