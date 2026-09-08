@@ -5,6 +5,9 @@ import wave
 from pathlib import Path
 from datetime import datetime
 import time
+import os
+
+from faster_whisper import WhisperModel
 
 HOST = "0.0.0.0"
 PORT = 7777
@@ -13,9 +16,26 @@ SAMPLE_RATE = 22050
 CHANNELS = 1
 SAMPLE_WIDTH = 2
 
-# If an END marker is lost, finish the current utterance after this much
-# network silence. This changes only the PC receiver, not KOYODA firmware.
+# Ignore tiny false fragments such as 0.01–0.06 s.
+MIN_UTTERANCE_SEC = 0.30
+
+# If END is lost, close the utterance after network silence.
 UTTERANCE_IDLE_TIMEOUT_SEC = 2.0
+
+# Multilingual model suitable for Thai/English.
+# Override in PowerShell if desired:
+#   $env:KOYODA_STT_MODEL="base"
+MODEL_NAME = os.environ.get("KOYODA_STT_MODEL", "small")
+
+print(f"Loading faster-whisper model: {MODEL_NAME}")
+print("First run may download the model once.")
+model = WhisperModel(
+    MODEL_NAME,
+    device="cpu",
+    compute_type="int8",
+)
+print("STT model ready.")
+print()
 
 
 def recv_exact(conn, n):
@@ -28,11 +48,52 @@ def recv_exact(conn, n):
     return bytes(data)
 
 
-def save_utterance(utterance, reason):
+def transcribe(path):
+    try:
+        segments, info = model.transcribe(
+            str(path),
+            beam_size=5,
+            vad_filter=False,
+        )
+
+        text = " ".join(
+            segment.text.strip()
+            for segment in segments
+            if segment.text.strip()
+        ).strip()
+
+        language = getattr(info, "language", None)
+        probability = getattr(info, "language_probability", None)
+
+        if text:
+            if language and probability is not None:
+                print(
+                    f"STT [{language} {probability:.2f}]: {text}"
+                )
+            elif language:
+                print(f"STT [{language}]: {text}")
+            else:
+                print(f"STT: {text}")
+        else:
+            print("STT: (no speech recognized)")
+
+    except Exception as exc:
+        print(f"STT ERROR: {exc}")
+
+
+def finish_utterance(utterance, reason):
     if not utterance:
         return
 
     seconds = len(utterance) / (SAMPLE_RATE * SAMPLE_WIDTH)
+
+    if seconds < MIN_UTTERANCE_SEC:
+        print(
+            f"IGNORED tiny fragment ({reason}): "
+            f"{seconds:.2f}s / {len(utterance)} bytes"
+        )
+        return
+
     ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
     out = Path(f"koyoda-{ts}.wav")
 
@@ -42,14 +103,18 @@ def save_utterance(utterance, reason):
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(utterance)
 
-    print(f"VOICE END ({reason}): {seconds:.2f}s / {len(utterance)} bytes")
+    print(
+        f"VOICE END ({reason}): "
+        f"{seconds:.2f}s / {len(utterance)} bytes"
+    )
     print(f"Saved: {out.resolve()}")
+
+    transcribe(out)
     print()
 
 
-print(f"KOYODA receiver v2 listening on {HOST}:{PORT}")
-print("Receiver-only boundary recovery enabled.")
-print("KOYODA firmware remains unchanged.")
+print(f"KOYODA STT receiver listening on {HOST}:{PORT}")
+print("ESP32 firmware is unchanged.")
 print()
 
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
@@ -69,16 +134,24 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
         try:
             with conn:
                 while True:
-                    readable, _, _ = select.select([conn], [], [], 0.25)
+                    readable, _, _ = select.select(
+                        [conn], [], [], 0.25
+                    )
 
                     if not readable:
                         if (
                             started
                             and last_packet_time is not None
-                            and (time.monotonic() - last_packet_time)
+                            and (
+                                time.monotonic()
+                                - last_packet_time
+                            )
                             >= UTTERANCE_IDLE_TIMEOUT_SEC
                         ):
-                            save_utterance(utterance, "timeout fallback")
+                            finish_utterance(
+                                utterance,
+                                "timeout fallback",
+                            )
                             utterance.clear()
                             started = False
                             last_packet_time = None
@@ -90,15 +163,24 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
                         raise ValueError("bad packet magic")
 
                     packet_type = header[4]
-                    payload_len = int.from_bytes(header[5:8], "big")
-                    payload = recv_exact(conn, payload_len) if payload_len else b""
+                    payload_len = int.from_bytes(
+                        header[5:8],
+                        "big",
+                    )
+                    payload = (
+                        recv_exact(conn, payload_len)
+                        if payload_len
+                        else b""
+                    )
+
                     last_packet_time = time.monotonic()
 
                     if packet_type == 1:  # START
                         if started:
-                            # Missing END from previous utterance:
-                            # treat this new START as an implicit END.
-                            save_utterance(utterance, "next START fallback")
+                            finish_utterance(
+                                utterance,
+                                "next START fallback",
+                            )
 
                         utterance.clear()
                         started = True
@@ -108,14 +190,20 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
                         utterance.extend(payload)
 
                     elif packet_type == 3 and started:  # END
-                        save_utterance(utterance, "END marker")
+                        finish_utterance(
+                            utterance,
+                            "END marker",
+                        )
                         utterance.clear()
                         started = False
                         last_packet_time = None
 
-        except (ConnectionError, OSError, ValueError) as e:
+        except (ConnectionError, OSError, ValueError) as exc:
             if started and utterance:
-                save_utterance(utterance, "disconnect fallback")
+                finish_utterance(
+                    utterance,
+                    "disconnect fallback",
+                )
 
-            print("Connection closed:", e)
+            print("Connection closed:", exc)
             print()
