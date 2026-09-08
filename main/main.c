@@ -17,6 +17,7 @@
 #include "koyoda_animation.h"
 #include "koyoda_wifi.h"
 #include "koyoda_audio_duplex.h"
+#include "koyoda_audio_stream.h"
 
 LV_IMAGE_DECLARE(koyoda_idle);
 LV_IMAGE_DECLARE(koyoda_half);
@@ -1384,6 +1385,15 @@ void app_main(void)
             TAG,
             "Shared audio start failed: %s; KOYODA continues without audio",
             esp_err_to_name(audio_err));
+    }
+
+    esp_err_t stream_err = koyoda_audio_stream_start();
+    if (stream_err != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Audio stream start failed: %s; KOYODA continues normally",
+            esp_err_to_name(stream_err));
     }
 
     xTaskCreate(

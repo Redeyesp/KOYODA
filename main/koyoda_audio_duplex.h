@@ -1,6 +1,8 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -29,6 +31,16 @@ bool koyoda_audio_duplex_mic_is_running(void);
  * This is intentionally exposed now so the next streaming step can reuse it.
  */
 bool koyoda_audio_duplex_vad_is_speaking(void);
+
+typedef void (*koyoda_audio_frame_cb_t)(
+    const int16_t *samples,
+    size_t sample_count,
+    bool vad_speaking,
+    void *user_ctx);
+
+void koyoda_audio_duplex_set_frame_callback(
+    koyoda_audio_frame_cb_t callback,
+    void *user_ctx);
 
 /* Quiet event beeps. */
 void koyoda_audio_duplex_beep_charge(void);

@@ -99,6 +99,9 @@ static volatile bool s_ready = false;
 static volatile bool s_mic_running = false;
 static volatile int s_volume_percent = DEFAULT_VOLUME_PERCENT;
 
+static koyoda_audio_frame_cb_t s_frame_callback = NULL;
+static void *s_frame_callback_ctx = NULL;
+
 /* VAD state. */
 static volatile bool s_vad_speaking = false;
 static uint32_t s_vad_noise_floor = 20U;
@@ -777,6 +780,16 @@ static void audio_owner_task(void *arg)
             frame_avg,
             frame_peak);
 
+        koyoda_audio_frame_cb_t frame_cb = s_frame_callback;
+        if (frame_cb != NULL)
+        {
+            frame_cb(
+                samples,
+                MIC_SAMPLES_PER_READ,
+                s_vad_speaking,
+                s_frame_callback_ctx);
+        }
+
         /*
          * Keep the CPU1 task cooperative.
          * This matches the stable mic-probe behavior.
@@ -854,6 +867,14 @@ bool koyoda_audio_duplex_mic_is_running(void)
 bool koyoda_audio_duplex_vad_is_speaking(void)
 {
     return s_vad_speaking;
+}
+
+void koyoda_audio_duplex_set_frame_callback(
+    koyoda_audio_frame_cb_t callback,
+    void *user_ctx)
+{
+    s_frame_callback_ctx = user_ctx;
+    s_frame_callback = callback;
 }
 
 void koyoda_audio_duplex_beep_charge(void)
