@@ -21,7 +21,7 @@
 static const char *TAG = "KOYODA_STREAM";
 
 #ifndef CONFIG_KOYODA_STREAM_HOST
-#define CONFIG_KOYODA_STREAM_HOST "192.168.1.36"
+#define CONFIG_KOYODA_STREAM_HOST "192.168.1.100"
 #endif
 
 #ifndef CONFIG_KOYODA_STREAM_PORT
@@ -35,9 +35,6 @@ static const char *TAG = "KOYODA_STREAM";
 #define STREAM_TYPE_PCM   2
 #define STREAM_TYPE_END   3
 
-#define RECONNECT_INTERVAL_MS 1500
-#define QUEUE_POLL_MS           50
-
 typedef struct
 {
     uint8_t type;
@@ -47,38 +44,20 @@ typedef struct
 
 static QueueHandle_t s_queue = NULL;
 static TaskHandle_t s_task = NULL;
-
-/*
- * Producer-side state.
- *
- * The audio callback is the only writer of s_prev_vad and
- * s_capture_this_utterance.
- */
 static volatile bool s_prev_vad = false;
-static volatile bool s_capture_this_utterance = false;
-
-/* Network task owns the socket but exposes connection state to the producer. */
-static volatile bool s_receiver_connected = false;
-
-/*
- * PCM may be dropped if Wi-Fi briefly cannot keep up. Control markers are
- * treated differently: END gets a reliable pending fallback so a full PCM
- * queue cannot erase the utterance boundary.
- */
-static volatile bool s_end_pending = false;
 static volatile uint32_t s_dropped_frames = 0;
 
-static bool queue_marker(uint8_t type)
+static void enqueue_marker(uint8_t type)
 {
-    if (s_queue == NULL)
-        return false;
+    if (s_queue == NULL) return;
 
     stream_msg_t msg = {
         .type = type,
         .sample_count = 0,
     };
 
-    return xQueueSend(s_queue, &msg, 0) == pdTRUE;
+    if (xQueueSend(s_queue, &msg, 0) != pdTRUE)
+        s_dropped_frames++;
 }
 
 static void audio_frame_callback(
@@ -88,122 +67,48 @@ static void audio_frame_callback(
     void *user_ctx)
 {
     (void)user_ctx;
+    if (s_queue == NULL) return;
 
-    if (s_queue == NULL)
-        return;
+    bool prev = s_prev_vad;
 
-    const bool prev = s_prev_vad;
-
-    /* New utterance. */
     if (!prev && vad_speaking)
-    {
-        s_dropped_frames = 0;
-        s_end_pending = false;
+        enqueue_marker(STREAM_TYPE_START);
 
-        /*
-         * Never start an utterance unless the receiver is already connected.
-         * This avoids stale START/PCM packets building up while TCP connect()
-         * is still in progress.
-         */
-        if (!s_receiver_connected)
-        {
-            s_capture_this_utterance = false;
-            ESP_LOGW(
-                TAG,
-                "VOICE detected but receiver is not connected; skipping this utterance");
-        }
-        else if (queue_marker(STREAM_TYPE_START))
-        {
-            s_capture_this_utterance = true;
-        }
-        else
-        {
-            /*
-             * A missing START would make the stream ambiguous, so skip this
-             * utterance rather than sending orphan PCM.
-             */
-            s_capture_this_utterance = false;
-            ESP_LOGW(
-                TAG,
-                "START queue full; skipping this utterance");
-        }
+    if (vad_speaking)
+    {
+        stream_msg_t msg = {
+            .type = STREAM_TYPE_PCM,
+            .sample_count = 0,
+        };
+
+        size_t n = sample_count;
+        if (n > STREAM_PCM_SAMPLES_PER_MSG)
+            n = STREAM_PCM_SAMPLES_PER_MSG;
+
+        memcpy(msg.samples, samples, n * sizeof(int16_t));
+        msg.sample_count = (uint16_t)n;
+
+        if (xQueueSend(s_queue, &msg, 0) != pdTRUE)
+            s_dropped_frames++;
     }
 
-    if (vad_speaking && s_capture_this_utterance)
-    {
-        /*
-         * If TCP died during speech, stop queuing immediately. The network
-         * task will reconnect for the next utterance.
-         */
-        if (!s_receiver_connected)
-        {
-            s_capture_this_utterance = false;
-        }
-        else
-        {
-            stream_msg_t msg = {
-                .type = STREAM_TYPE_PCM,
-                .sample_count = 0,
-            };
-
-            size_t n = sample_count;
-            if (n > STREAM_PCM_SAMPLES_PER_MSG)
-                n = STREAM_PCM_SAMPLES_PER_MSG;
-
-            memcpy(
-                msg.samples,
-                samples,
-                n * sizeof(int16_t));
-
-            msg.sample_count = (uint16_t)n;
-
-            if (xQueueSend(s_queue, &msg, 0) != pdTRUE)
-                s_dropped_frames++;
-        }
-    }
-
-    /* End of utterance. */
     if (prev && !vad_speaking)
-    {
-        if (s_capture_this_utterance)
-        {
-            /*
-             * END must not disappear merely because the PCM queue is full.
-             * If immediate enqueue fails, the network task sends END as soon
-             * as it drains the queued PCM.
-             */
-            if (!queue_marker(STREAM_TYPE_END))
-                s_end_pending = true;
-        }
-
-        s_capture_this_utterance = false;
-    }
+        enqueue_marker(STREAM_TYPE_END);
 
     s_prev_vad = vad_speaking;
 }
 
-static bool send_all(
-    int sock,
-    const void *data,
-    size_t len)
+static bool send_all(int sock, const void *data, size_t len)
 {
     const uint8_t *p = (const uint8_t *)data;
     size_t sent = 0;
 
     while (sent < len)
     {
-        int ret = send(
-            sock,
-            p + sent,
-            len - sent,
-            0);
-
-        if (ret <= 0)
-            return false;
-
+        int ret = send(sock, p + sent, len - sent, 0);
+        if (ret <= 0) return false;
         sent += (size_t)ret;
     }
-
     return true;
 }
 
@@ -214,37 +119,28 @@ static bool send_packet(
     uint32_t payload_len)
 {
     uint8_t header[8] = {
-        'K', 'O', 'Y', 'A',
+        'K','O','Y','A',
         type,
         (uint8_t)((payload_len >> 16) & 0xFF),
         (uint8_t)((payload_len >> 8) & 0xFF),
         (uint8_t)(payload_len & 0xFF)
     };
 
-    if (!send_all(sock, header, sizeof(header)))
-        return false;
-
+    if (!send_all(sock, header, sizeof(header))) return false;
     if (payload_len > 0)
         return send_all(sock, payload, payload_len);
-
     return true;
 }
 
 static int connect_receiver(void)
 {
     char port_text[8];
-
-    snprintf(
-        port_text,
-        sizeof(port_text),
-        "%d",
-        CONFIG_KOYODA_STREAM_PORT);
+    snprintf(port_text, sizeof(port_text), "%d", CONFIG_KOYODA_STREAM_PORT);
 
     struct addrinfo hints = {
         .ai_family = AF_INET,
         .ai_socktype = SOCK_STREAM,
     };
-
     struct addrinfo *result = NULL;
 
     int gai = getaddrinfo(
@@ -267,11 +163,7 @@ static int connect_receiver(void)
         return -1;
     }
 
-    int ret = connect(
-        sock,
-        result->ai_addr,
-        result->ai_addrlen);
-
+    int ret = connect(sock, result->ai_addr, result->ai_addrlen);
     freeaddrinfo(result);
 
     if (ret != 0)
@@ -283,202 +175,73 @@ static int connect_receiver(void)
     return sock;
 }
 
-static void close_receiver(int *sock)
-{
-    s_receiver_connected = false;
-
-    if (*sock >= 0)
-    {
-        close(*sock);
-        *sock = -1;
-    }
-
-    /*
-     * Old queued PCM/control data is invalid after a broken TCP stream.
-     * Dropping it is safer than replaying it into the next connection.
-     */
-    if (s_queue != NULL)
-        xQueueReset(s_queue);
-
-    s_end_pending = false;
-}
-
 static void stream_task(void *arg)
 {
     (void)arg;
 
     ESP_LOGI(
         TAG,
-        "STREAM STEP1.1 ready -> %s:%d",
+        "STREAM STEP1 ready -> %s:%d",
         CONFIG_KOYODA_STREAM_HOST,
         CONFIG_KOYODA_STREAM_PORT);
 
     int sock = -1;
-
     uint64_t utterance_bytes = 0;
     TickType_t utterance_start = 0;
-    TickType_t last_connect_attempt = 0;
-    bool stream_open = false;
 
     while (1)
     {
-        /*
-         * Connect proactively while KOYODA is idle.
-         *
-         * The first speech frame therefore never has to wait for TCP connect()
-         * and the tiny audio queue is reserved for PCM rather than connection
-         * latency.
-         */
-        if (sock < 0)
-        {
-            TickType_t now = xTaskGetTickCount();
-
-            if ((now - last_connect_attempt) >=
-                pdMS_TO_TICKS(RECONNECT_INTERVAL_MS))
-            {
-                last_connect_attempt = now;
-
-                sock = connect_receiver();
-
-                if (sock >= 0)
-                {
-                    s_receiver_connected = true;
-
-                    ESP_LOGI(
-                        TAG,
-                        "TCP receiver connected and ready");
-
-                    /*
-                     * Ensure nothing collected before this fresh connection
-                     * can leak into it.
-                     */
-                    xQueueReset(s_queue);
-                    s_end_pending = false;
-                    stream_open = false;
-                }
-            }
-        }
-
         stream_msg_t msg;
-        bool have_msg =
-            xQueueReceive(
-                s_queue,
-                &msg,
-                pdMS_TO_TICKS(QUEUE_POLL_MS)) == pdTRUE;
 
-        if (sock < 0)
+        if (xQueueReceive(s_queue, &msg, portMAX_DELAY) != pdTRUE)
             continue;
 
-        if (have_msg)
+        if (sock < 0)
         {
-            bool ok = true;
+            sock = connect_receiver();
 
-            if (msg.type == STREAM_TYPE_START)
+            if (sock < 0)
             {
-                utterance_bytes = 0;
-                utterance_start = xTaskGetTickCount();
-
-                ok = send_packet(
-                    sock,
-                    STREAM_TYPE_START,
-                    NULL,
-                    0);
-
-                if (ok)
+                if (msg.type == STREAM_TYPE_START)
                 {
-                    stream_open = true;
-                    ESP_LOGI(TAG, "VOICE STREAM START");
+                    ESP_LOGW(
+                        TAG,
+                        "Receiver unavailable at %s:%d",
+                        CONFIG_KOYODA_STREAM_HOST,
+                        CONFIG_KOYODA_STREAM_PORT);
                 }
-            }
-            else if (msg.type == STREAM_TYPE_PCM)
-            {
-                if (stream_open)
-                {
-                    uint32_t bytes =
-                        (uint32_t)msg.sample_count *
-                        sizeof(int16_t);
-
-                    ok = send_packet(
-                        sock,
-                        STREAM_TYPE_PCM,
-                        msg.samples,
-                        bytes);
-
-                    if (ok)
-                        utterance_bytes += bytes;
-                }
-            }
-            else if (msg.type == STREAM_TYPE_END)
-            {
-                if (stream_open)
-                {
-                    ok = send_packet(
-                        sock,
-                        STREAM_TYPE_END,
-                        NULL,
-                        0);
-
-                    if (ok)
-                    {
-                        uint32_t duration_ms =
-                            (uint32_t)(
-                                (xTaskGetTickCount() - utterance_start) *
-                                portTICK_PERIOD_MS);
-
-                        ESP_LOGI(
-                            TAG,
-                            "VOICE STREAM END duration=%lums bytes=%llu dropped=%lu",
-                            (unsigned long)duration_ms,
-                            (unsigned long long)utterance_bytes,
-                            (unsigned long)s_dropped_frames);
-
-                        stream_open = false;
-                    }
-                }
-            }
-
-            if (!ok)
-            {
-                ESP_LOGW(
-                    TAG,
-                    "Socket send failed errno=%d; reconnecting",
-                    errno);
-
-                close_receiver(&sock);
-                stream_open = false;
                 continue;
             }
+
+            ESP_LOGI(TAG, "TCP connected to receiver");
         }
 
-        /*
-         * Reliable END fallback:
-         * if END could not be queued because PCM filled all 12 slots, wait
-         * until the network task has drained the PCM and then send END itself.
-         */
-        if (sock >= 0 &&
-            stream_open &&
-            s_end_pending &&
-            uxQueueMessagesWaiting(s_queue) == 0)
+        bool ok = true;
+
+        if (msg.type == STREAM_TYPE_START)
         {
-            bool ok = send_packet(
+            utterance_bytes = 0;
+            utterance_start = xTaskGetTickCount();
+            ok = send_packet(sock, STREAM_TYPE_START, NULL, 0);
+            ESP_LOGI(TAG, "VOICE STREAM START");
+        }
+        else if (msg.type == STREAM_TYPE_PCM)
+        {
+            uint32_t bytes =
+                (uint32_t)msg.sample_count * sizeof(int16_t);
+
+            ok = send_packet(
                 sock,
-                STREAM_TYPE_END,
-                NULL,
-                0);
+                STREAM_TYPE_PCM,
+                msg.samples,
+                bytes);
 
-            if (!ok)
-            {
-                ESP_LOGW(
-                    TAG,
-                    "Pending END send failed errno=%d; reconnecting",
-                    errno);
-
-                close_receiver(&sock);
-                stream_open = false;
-                continue;
-            }
-
-            s_end_pending = false;
+            if (ok)
+                utterance_bytes += bytes;
+        }
+        else if (msg.type == STREAM_TYPE_END)
+        {
+            ok = send_packet(sock, STREAM_TYPE_END, NULL, 0);
 
             uint32_t duration_ms =
                 (uint32_t)(
@@ -487,12 +250,20 @@ static void stream_task(void *arg)
 
             ESP_LOGI(
                 TAG,
-                "VOICE STREAM END duration=%lums bytes=%llu dropped=%lu (reliable END)",
+                "VOICE STREAM END duration=%lums bytes=%llu dropped=%lu",
                 (unsigned long)duration_ms,
                 (unsigned long long)utterance_bytes,
                 (unsigned long)s_dropped_frames);
+        }
 
-            stream_open = false;
+        if (!ok)
+        {
+            ESP_LOGW(
+                TAG,
+                "Socket send failed errno=%d; closing connection",
+                errno);
+            close(sock);
+            sock = -1;
         }
     }
 }
@@ -522,7 +293,6 @@ esp_err_t koyoda_audio_stream_start(void)
         vQueueDelete(s_queue);
         s_queue = NULL;
         s_task = NULL;
-
         return ESP_ERR_NO_MEM;
     }
 
