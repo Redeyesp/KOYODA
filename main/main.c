@@ -47,6 +47,8 @@ static lv_obj_t *wifi_page = NULL;
 static lv_obj_t *wifi_status_label = NULL;
 static lv_obj_t *wifi_detail_label = NULL;
 static lv_obj_t *wifi_rssi_label = NULL;
+static lv_obj_t *wifi_change_button = NULL;
+static lv_obj_t *wifi_change_button_label = NULL;
 static lv_obj_t *wifi_signal_bars[4] = {NULL, NULL, NULL, NULL};
 
 static lv_obj_t *volume_page = NULL;
@@ -102,8 +104,8 @@ static volatile koyoda_page_t current_page = PAGE_FACE;
 static lv_point_t swipe_start = {0, 0};
 static bool swipe_tracking = false;
 
-/* Volume page sits above the transparent global swipe layer while active,
- * so it reuses this same swipe handler directly. */
+/* Wi-Fi and Volume can sit above the transparent global swipe layer while active,
+ * so both reuse this same swipe handler directly. */
 static void swipe_event_cb(lv_event_t *e);
 
 /* =========================================================
@@ -427,6 +429,53 @@ static void update_wifi_ui_locked(void)
 
     const bool connected = koyoda_wifi_is_connected();
     const int rssi = koyoda_wifi_get_rssi();
+    const bool provisioning = koyoda_wifi_is_provisioning();
+    const koyoda_wifi_setup_state_t setup_state = koyoda_wifi_get_setup_state();
+
+    if (provisioning)
+    {
+        set_wifi_bar_level_locked(0);
+
+        if (setup_state == KOYODA_WIFI_SETUP_TESTING)
+        {
+            lv_label_set_text(wifi_status_label, "TESTING...");
+            lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0xFFD166), 0);
+            lv_label_set_text(wifi_detail_label, "Trying new Wi-Fi");
+            lv_label_set_text(wifi_rssi_label, "Keep phone connected");
+        }
+        else if (setup_state == KOYODA_WIFI_SETUP_FAILED)
+        {
+            lv_label_set_text(wifi_status_label, "TRY AGAIN");
+            lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0xFF7FA3), 0);
+            lv_label_set_text(wifi_detail_label, "Join KOYODA-Setup");
+            lv_label_set_text(wifi_rssi_label, "PW: koyoda88");
+        }
+        else if (setup_state == KOYODA_WIFI_SETUP_SUCCESS)
+        {
+            lv_label_set_text(wifi_status_label, "SAVED");
+            lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0x00D5D5), 0);
+            lv_label_set_text(wifi_detail_label, "New Wi-Fi connected");
+            lv_label_set_text(wifi_rssi_label, "Setup closing...");
+        }
+        else
+        {
+            lv_label_set_text(wifi_status_label, "SETUP MODE");
+            lv_obj_set_style_text_color(wifi_status_label, lv_color_hex(0x00D5D5), 0);
+            lv_label_set_text(wifi_detail_label, "Join KOYODA-Setup");
+            lv_label_set_text(wifi_rssi_label, "PW: koyoda88");
+        }
+
+        if (wifi_change_button_label != NULL)
+        {
+            lv_label_set_text(wifi_change_button_label, "SETUP ACTIVE");
+        }
+        return;
+    }
+
+    if (wifi_change_button_label != NULL)
+    {
+        lv_label_set_text(wifi_change_button_label, "CHANGE WI-FI");
+    }
 
     if (!connected)
     {
@@ -448,19 +497,18 @@ static void update_wifi_ui_locked(void)
         return;
     }
 
-    /*
-     * koyoda_wifi_is_connected() becomes true only after
-     * IP_EVENT_STA_GOT_IP, so CONNECTED means association + DHCP succeeded.
-     */
+    /* Connected becomes true only after DHCP succeeds. */
     lv_label_set_text(wifi_status_label, "CONNECTED");
     lv_obj_set_style_text_color(
         wifi_status_label,
         lv_color_hex(0x00D5D5),
         0);
 
+    char ssid[33];
+    koyoda_wifi_get_ssid(ssid, sizeof(ssid));
     lv_label_set_text(
         wifi_detail_label,
-        "IP acquired");
+        ssid[0] ? ssid : "IP acquired");
 
     char rssi_text[32];
     snprintf(
@@ -487,6 +535,25 @@ static void update_wifi_ui_locked(void)
     set_wifi_bar_level_locked(bars);
 }
 
+static void wifi_change_button_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+    {
+        return;
+    }
+
+    esp_err_t ret = koyoda_wifi_begin_provisioning();
+    if (ret == ESP_OK)
+    {
+        wifi_refresh_requested = true;
+        ESP_LOGI(TAG, "Phone Wi-Fi setup requested");
+    }
+    else
+    {
+        ESP_LOGW(TAG, "Wi-Fi setup request failed: %s", esp_err_to_name(ret));
+    }
+}
+
 static void create_wifi_page(lv_obj_t *screen)
 {
     wifi_page = lv_obj_create(screen);
@@ -498,6 +565,7 @@ static void create_wifi_page(lv_obj_t *screen)
     lv_obj_set_style_pad_all(wifi_page, 0, 0);
     lv_obj_set_style_radius(wifi_page, 0, 0);
     lv_obj_clear_flag(wifi_page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(wifi_page, LV_OBJ_FLAG_CLICKABLE);
 
     /* Same confirmed 90-degree physical orientation as Face/Battery. */
     lv_obj_set_style_transform_pivot_x(wifi_page, 233, 0);
@@ -590,7 +658,29 @@ static void create_wifi_page(lv_obj_t *screen)
         wifi_rssi_label,
         LV_ALIGN_CENTER,
         0,
-        134);
+        126);
+
+    wifi_change_button = lv_button_create(wifi_page);
+    lv_obj_set_size(wifi_change_button, 190, 54);
+    lv_obj_align(wifi_change_button, LV_ALIGN_CENTER, 0, 174);
+    lv_obj_set_style_radius(wifi_change_button, 18, 0);
+    lv_obj_set_style_bg_color(wifi_change_button, lv_color_hex(0x17272D), 0);
+    lv_obj_set_style_border_width(wifi_change_button, 2, 0);
+    lv_obj_set_style_border_color(wifi_change_button, lv_color_hex(0x00D5D5), 0);
+    lv_obj_add_flag(wifi_change_button, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_event_cb(wifi_change_button, wifi_change_button_cb, LV_EVENT_CLICKED, NULL);
+
+    wifi_change_button_label = lv_label_create(wifi_change_button);
+    lv_label_set_text(wifi_change_button_label, "CHANGE WI-FI");
+    lv_obj_set_style_text_color(wifi_change_button_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(wifi_change_button_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(wifi_change_button_label);
+
+    /* Wi-Fi page moves above the transparent swipe layer while visible so
+     * the setup button receives touch. It therefore owns swipe input too. */
+    lv_obj_add_event_cb(wifi_page, swipe_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(wifi_page, swipe_event_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(wifi_page, swipe_event_cb, LV_EVENT_PRESS_LOST, NULL);
 
     lv_obj_add_flag(wifi_page, LV_OBJ_FLAG_HIDDEN);
 }
@@ -876,7 +966,9 @@ static void set_page_from_lvgl(koyoda_page_t page)
     {
         lv_obj_clear_flag(wifi_page, LV_OBJ_FLAG_HIDDEN);
         wifi_refresh_requested = true;
+        lv_obj_move_foreground(wifi_page);
         ESP_LOGI(TAG, "Page -> WIFI");
+        return;
     }
     else if (page == PAGE_VOLUME)
     {
@@ -894,8 +986,8 @@ static void set_page_from_lvgl(koyoda_page_t page)
     }
 
     /*
-     * On Face/Battery/Wi-Fi the existing transparent layer stays on top
-     * and owns swipe navigation exactly as before.
+     * On Face/Battery the existing transparent layer stays on top.
+     * Wi-Fi and Volume return above after taking ownership of swipe input.
      */
     lv_obj_move_foreground(swipe_layer);
 }
