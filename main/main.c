@@ -64,10 +64,6 @@ static volatile bool power_dialog_requested = false;
 static volatile bool battery_refresh_requested = false;
 static volatile bool wifi_refresh_requested = false;
 static uint32_t wifi_last_refresh_ms = 0;
-static koyoda_wifi_setup_state_t wifi_last_setup_state = KOYODA_WIFI_SETUP_OFF;
-static bool wifi_last_provisioning = false;
-static bool wifi_last_connected = false;
-static bool wifi_force_full_redraw = false;
 
 /* Real AXP2101 charging-event state.
  * The animation is triggered on a false -> true charging transition.
@@ -972,6 +968,11 @@ static void set_page_from_lvgl(koyoda_page_t page)
         lv_obj_clear_flag(wifi_page, LV_OBJ_FLAG_HIDDEN);
         wifi_refresh_requested = true;
         lv_obj_move_foreground(wifi_page);
+        /* A Wi-Fi connect/channel transition can leave stale pixels in the
+         * panel buffer even though LVGL itself is still responsive. Repaint
+         * the whole screen only when the user changes page; do not poll Wi-Fi
+         * state from the animation loop. */
+        lv_obj_invalidate(lv_screen_active());
         ESP_LOGI(TAG, "Page -> WIFI");
         return;
     }
@@ -985,6 +986,7 @@ static void set_page_from_lvgl(koyoda_page_t page)
          * swipe layer so its - / + / TEST buttons receive touch.
          */
         lv_obj_move_foreground(volume_page);
+        lv_obj_invalidate(lv_screen_active());
 
         ESP_LOGI(TAG, "Page -> VOLUME");
         return;
@@ -995,6 +997,7 @@ static void set_page_from_lvgl(koyoda_page_t page)
      * Wi-Fi and Volume return above after taking ownership of swipe input.
      */
     lv_obj_move_foreground(swipe_layer);
+    lv_obj_invalidate(lv_screen_active());
 }
 
 static void navigate_next_from_lvgl(void)
@@ -1341,25 +1344,6 @@ static void face_animation_step(void)
         &koyoda_charge_4, &koyoda_charge_5, &koyoda_charge_6,
         &fun_happy
     };
-    const bool provisioning_now = koyoda_wifi_is_provisioning();
-    const bool connected_now = koyoda_wifi_is_connected();
-    const koyoda_wifi_setup_state_t setup_now = koyoda_wifi_get_setup_state();
-
-    /* A STA scan/connect attempt can briefly starve display service on CPU0.
-     * When the network transition ends, force one full repaint so any partial
-     * DMA/LVGL artefact is replaced instead of remaining on screen. */
-    if ((wifi_last_setup_state == KOYODA_WIFI_SETUP_TESTING &&
-         setup_now != KOYODA_WIFI_SETUP_TESTING) ||
-        (wifi_last_provisioning && !provisioning_now) ||
-        (!wifi_last_connected && connected_now))
-    {
-        wifi_force_full_redraw = true;
-        wifi_refresh_requested = true;
-    }
-    wifi_last_setup_state = setup_now;
-    wifi_last_provisioning = provisioning_now;
-    wifi_last_connected = connected_now;
-
     bsp_display_lock(-1);
 
     uint32_t now_ms = lv_tick_get();
@@ -1372,20 +1356,11 @@ static void face_animation_step(void)
         touch_held,
         &charging_animation_pending);
 
-    /* During the short credential test, avoid pushing large face frames while
-     * the Wi-Fi driver is busy associating. Navigation and status UI remain live. */
-    if (setup_now != KOYODA_WIFI_SETUP_TESTING &&
-        current_page == PAGE_FACE &&
+    if (current_page == PAGE_FACE &&
         !power_dialog_open &&
         lv_image_get_src(face_img) != frames[frame])
     {
         lv_image_set_src(face_img, frames[frame]);
-    }
-
-    if (wifi_force_full_redraw)
-    {
-        lv_obj_invalidate(lv_screen_active());
-        wifi_force_full_redraw = false;
     }
 
     /*
