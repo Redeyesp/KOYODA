@@ -325,6 +325,16 @@ static void wifi_event_handler(void *arg,
             return;
         }
 
+        /* While the phone setup portal is open, deliberately keep the STA
+         * idle.  esp_wifi_scan_start() returns ESP_ERR_WIFI_STATE when the
+         * station is CONNECTING, so the normal auto-reconnect loop would
+         * otherwise starve portal discovery if the previous AP is absent. */
+        if (s_provisioning)
+        {
+            ESP_LOGI(TAG, "Provisioning active; STA auto-reconnect paused for scan");
+            return;
+        }
+
         char ssid[33];
         char password[65];
         if (copy_active_credentials(ssid, sizeof(ssid), password, sizeof(password)))
@@ -378,25 +388,30 @@ static int compare_ap_rssi(const void *a, const void *b)
 
 static esp_err_t start_network_scan_async(void)
 {
-    /* Deliberately non-blocking. This is called only after the phone has
-     * opened the setup page, never during boot and never before SoftAP/HTTP
-     * are already usable. */
-    wifi_scan_config_t scan = {0};
-    scan.show_hidden = false;
-    scan.scan_type = WIFI_SCAN_TYPE_ACTIVE;
-    scan.scan_time.active.min = 20;
-    scan.scan_time.active.max = 40;
-
+    /* Deliberately non-blocking and use the ESP-IDF default scan dwell
+     * parameters.  The old 20-40 ms/channel window was unnecessarily short
+     * and could miss AP beacons.  NULL means active all-channel scan with
+     * the driver's tested defaults (including home-channel dwell). */
     s_scan_requested = false;
     s_scan_count = 0;
     s_scan_ready = false;
     s_scan_done_pending = false;
 
-    esp_err_t ret = esp_wifi_scan_start(&scan, false);
+    esp_err_t ret = esp_wifi_scan_start(NULL, false);
     if (ret == ESP_OK)
     {
         s_scan_in_progress = true;
-        ESP_LOGI(TAG, "Portal-triggered async Wi-Fi scan started");
+        ESP_LOGI(TAG, "Portal-triggered async Wi-Fi scan started (IDF defaults)");
+    }
+    else if (ret == ESP_ERR_WIFI_STATE)
+    {
+        /* A connect may have been finishing as provisioning started. Retry
+         * from the low-priority provisioning loop instead of publishing a
+         * false '0 networks found' result. */
+        s_scan_in_progress = false;
+        s_scan_requested = true;
+        s_scan_ready = false;
+        ESP_LOGW(TAG, "Wi-Fi busy connecting; portal scan will retry");
     }
     else
     {
@@ -664,7 +679,7 @@ static esp_err_t portal_root_get(httpd_req_t *req)
         "<input name='ssid_manual' maxlength='32' autocomplete='off' placeholder='Type SSID only if it is not listed'>"
         "<label>Password</label><input name='password' type='password' maxlength='64' autocomplete='new-password' placeholder='Leave blank for an open network'>"
         "<button type='submit'>CONNECT KOYODA</button></form>"
-        "<p class='small'>The hotspot starts first. KOYODA scans only after this page is opened, and the scan is asynchronous. Only 2.4 GHz networks are supported. A new network is saved only after KOYODA obtains an IP address.</p>"
+        "<p class='small'>The hotspot starts first. KOYODA pauses its old Wi-Fi connection while scanning, then lists nearby 2.4 GHz networks. A new network is saved only after KOYODA obtains an IP address.</p>"
         "</div></div>";
 
     httpd_resp_send_chunk(req, tail, HTTPD_RESP_USE_STRLEN);
@@ -969,6 +984,20 @@ static void provisioning_task(void *arg)
     /* Give the Wi-Fi driver one scheduler slice to start AP beacons before
      * starting the HTTP server. This is asynchronous and does not touch LVGL. */
     vTaskDelay(pdMS_TO_TICKS(200));
+
+    /* Keep APSTA mode, but park the STA before portal discovery. This avoids
+     * scan-vs-connect contention while KOYODA-Setup remains visible to the
+     * phone. Old credentials stay in RAM/NVS and are restored on exit/fail. */
+    esp_err_t disc_ret = esp_wifi_disconnect();
+    if (disc_ret == ESP_OK)
+    {
+        ESP_LOGI(TAG, "STA disconnected for clean provisioning scan");
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+    else
+    {
+        ESP_LOGI(TAG, "STA already idle for provisioning scan: %s", esp_err_to_name(disc_ret));
+    }
 
     esp_netif_ip_info_t ap_ip = {0};
     if (s_ap_netif != NULL && esp_netif_get_ip_info(s_ap_netif, &ap_ip) == ESP_OK)
