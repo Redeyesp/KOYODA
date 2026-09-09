@@ -2,9 +2,11 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -55,6 +57,22 @@ static const char *TAG = "KOYODA_AUDIO";
 #define AUDIO_TASK_PRIORITY                 2
 #define AUDIO_TASK_CORE                     1
 
+/* AI-06 remote TTS playback: keep chunks small and bounded. */
+#define PLAYBACK_CHUNK_SAMPLES            256
+#define PLAYBACK_QUEUE_DEPTH                4
+#define PLAYBACK_WAIT_TIMEOUT_MS          3000
+
+#define PLAYBACK_MSG_START                  1
+#define PLAYBACK_MSG_PCM                    2
+#define PLAYBACK_MSG_END                    3
+
+typedef struct
+{
+    uint8_t type;
+    uint16_t sample_count;
+    int16_t samples[PLAYBACK_CHUNK_SAMPLES];
+} playback_msg_t;
+
 /* =========================================================
  * VAD Step 1
  *
@@ -91,6 +109,7 @@ static const char *TAG = "KOYODA_AUDIO";
 #define NVS_KEY_VOLUME "volume"
 
 static TaskHandle_t s_audio_task = NULL;
+static QueueHandle_t s_playback_queue = NULL;
 
 static esp_codec_dev_handle_t s_mic = NULL;
 static esp_codec_dev_handle_t s_speaker = NULL;
@@ -490,6 +509,94 @@ static bool play_one_beep(void)
     return true;
 }
 
+static void service_remote_playback_if_pending(void)
+{
+    if (s_playback_queue == NULL || s_speaker == NULL)
+    {
+        return;
+    }
+
+    playback_msg_t msg;
+
+    if (xQueueReceive(s_playback_queue, &msg, 0) != pdTRUE)
+    {
+        return;
+    }
+
+    /* Ignore stale data until a fresh START marker arrives. */
+    if (msg.type != PLAYBACK_MSG_START)
+    {
+        ESP_LOGW(TAG, "Dropping remote playback packet before START");
+        return;
+    }
+
+    ESP_LOGI(TAG, "REMOTE SPEAK START: mic/VAD paused");
+
+    s_mic_running = false;
+    vad_reset_after_beep();
+
+    uint64_t total_samples = 0;
+    TickType_t started = xTaskGetTickCount();
+    bool finished = false;
+
+    while (!finished)
+    {
+        if (xQueueReceive(
+                s_playback_queue,
+                &msg,
+                pdMS_TO_TICKS(PLAYBACK_WAIT_TIMEOUT_MS)) != pdTRUE)
+        {
+            ESP_LOGW(
+                TAG,
+                "REMOTE SPEAK timeout waiting for PCM/END; aborting");
+            break;
+        }
+
+        if (msg.type == PLAYBACK_MSG_PCM)
+        {
+            if (msg.sample_count == 0)
+            {
+                continue;
+            }
+
+            int ret = esp_codec_dev_write(
+                s_speaker,
+                msg.samples,
+                (size_t)msg.sample_count * sizeof(int16_t));
+
+            if (ret != ESP_CODEC_DEV_OK)
+            {
+                ESP_LOGE(TAG, "Remote speaker write failed: %d", ret);
+                break;
+            }
+
+            total_samples += msg.sample_count;
+        }
+        else if (msg.type == PLAYBACK_MSG_END)
+        {
+            finished = true;
+        }
+        else if (msg.type == PLAYBACK_MSG_START)
+        {
+            /* A repeated START restarts timing but does not touch the codec. */
+            started = xTaskGetTickCount();
+            total_samples = 0;
+        }
+    }
+
+    vad_reset_after_beep();
+    s_mic_running = true;
+
+    uint32_t duration_ms =
+        (uint32_t)((xTaskGetTickCount() - started) * portTICK_PERIOD_MS);
+
+    ESP_LOGI(
+        TAG,
+        "REMOTE SPEAK END duration=%lums samples=%llu; mic/VAD resumed",
+        (unsigned long)duration_ms,
+        (unsigned long long)total_samples);
+}
+
 static bool initialize_shared_audio(void)
 {
     log_memory("before shared audio init");
@@ -730,6 +837,13 @@ static void audio_owner_task(void *arg)
             service_events(events);
         }
 
+        /*
+         * Remote TTS playback is serviced by this same owner task.
+         * While it runs, no microphone reads occur, giving us half-duplex
+         * audio and preventing KOYODA from hearing its own generated voice.
+         */
+        service_remote_playback_if_pending();
+
         int ret = esp_codec_dev_read(
             s_mic,
             samples,
@@ -835,6 +949,18 @@ esp_err_t koyoda_audio_duplex_start(void)
 
     load_volume_from_nvs();
 
+    if (s_playback_queue == NULL)
+    {
+        s_playback_queue = xQueueCreate(
+            PLAYBACK_QUEUE_DEPTH,
+            sizeof(playback_msg_t));
+
+        if (s_playback_queue == NULL)
+        {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     BaseType_t result =
         xTaskCreatePinnedToCore(
             audio_owner_task,
@@ -848,6 +974,13 @@ esp_err_t koyoda_audio_duplex_start(void)
     if (result != pdPASS)
     {
         s_audio_task = NULL;
+
+        if (s_playback_queue != NULL)
+        {
+            vQueueDelete(s_playback_queue);
+            s_playback_queue = NULL;
+        }
+
         return ESP_ERR_NO_MEM;
     }
 
@@ -901,6 +1034,83 @@ void koyoda_audio_duplex_beep_test(void)
             AUDIO_EVT_TEST_BEEP,
             eSetBits);
     }
+}
+
+static esp_err_t playback_enqueue(
+    const playback_msg_t *msg,
+    TickType_t wait_ticks)
+{
+    if (s_playback_queue == NULL || s_audio_task == NULL || !s_ready)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xQueueSend(s_playback_queue, msg, wait_ticks) != pdTRUE)
+    {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t koyoda_audio_duplex_playback_start(void)
+{
+    playback_msg_t msg = {
+        .type = PLAYBACK_MSG_START,
+        .sample_count = 0,
+    };
+
+    return playback_enqueue(&msg, pdMS_TO_TICKS(1000));
+}
+
+esp_err_t koyoda_audio_duplex_playback_write(
+    const int16_t *samples,
+    size_t sample_count)
+{
+    if (samples == NULL || sample_count == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    while (sample_count > 0)
+    {
+        size_t n = sample_count;
+        if (n > PLAYBACK_CHUNK_SAMPLES)
+        {
+            n = PLAYBACK_CHUNK_SAMPLES;
+        }
+
+        playback_msg_t msg = {
+            .type = PLAYBACK_MSG_PCM,
+            .sample_count = (uint16_t)n,
+        };
+
+        memcpy(msg.samples, samples, n * sizeof(int16_t));
+
+        esp_err_t err = playback_enqueue(
+            &msg,
+            pdMS_TO_TICKS(1000));
+
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+
+        samples += n;
+        sample_count -= n;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t koyoda_audio_duplex_playback_end(void)
+{
+    playback_msg_t msg = {
+        .type = PLAYBACK_MSG_END,
+        .sample_count = 0,
+    };
+
+    return playback_enqueue(&msg, pdMS_TO_TICKS(1000));
 }
 
 int koyoda_audio_duplex_get_volume(void)

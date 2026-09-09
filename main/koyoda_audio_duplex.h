@@ -46,6 +46,19 @@ void koyoda_audio_duplex_set_frame_callback(
 void koyoda_audio_duplex_beep_charge(void);
 void koyoda_audio_duplex_beep_test(void);
 
+/*
+ * AI-06 remote reply playback.
+ * PCM format MUST be 22050 Hz / signed 16-bit little-endian / mono.
+ * Data is queued to the single audio-owner task so no network task ever
+ * touches ES8311 directly. While a remote reply is playing, mic capture and
+ * VAD are paused (half-duplex) to prevent KOYODA from hearing itself.
+ */
+esp_err_t koyoda_audio_duplex_playback_start(void);
+esp_err_t koyoda_audio_duplex_playback_write(
+    const int16_t *samples,
+    size_t sample_count);
+esp_err_t koyoda_audio_duplex_playback_end(void);
+
 /* Persistent master speaker volume, 0..100. */
 int  koyoda_audio_duplex_get_volume(void);
 void koyoda_audio_duplex_set_volume(int percent);

@@ -30,10 +30,17 @@ static const char *TAG = "KOYODA_STREAM";
 
 #define STREAM_QUEUE_DEPTH 12
 #define STREAM_PCM_SAMPLES_PER_MSG 256
+#define STREAM_RX_MAX_BYTES (STREAM_PCM_SAMPLES_PER_MSG * sizeof(int16_t))
 
+/* KOYODA -> PC microphone stream. */
 #define STREAM_TYPE_START 1
 #define STREAM_TYPE_PCM   2
 #define STREAM_TYPE_END   3
+
+/* PC -> KOYODA AI reply playback. */
+#define STREAM_TYPE_PLAY_START 4
+#define STREAM_TYPE_PLAY_PCM   5
+#define STREAM_TYPE_PLAY_END   6
 
 typedef struct
 {
@@ -112,6 +119,24 @@ static bool send_all(int sock, const void *data, size_t len)
     return true;
 }
 
+static bool recv_all(int sock, void *data, size_t len)
+{
+    uint8_t *p = (uint8_t *)data;
+    size_t received = 0;
+
+    while (received < len)
+    {
+        int ret = recv(sock, p + received, len - received, 0);
+        if (ret <= 0)
+        {
+            return false;
+        }
+        received += (size_t)ret;
+    }
+
+    return true;
+}
+
 static bool send_packet(
     int sock,
     uint8_t type,
@@ -130,6 +155,108 @@ static bool send_packet(
     if (payload_len > 0)
         return send_all(sock, payload, payload_len);
     return true;
+}
+
+static bool receive_playback_packet(
+    int sock,
+    bool *playback_open)
+{
+    uint8_t header[8];
+
+    if (!recv_all(sock, header, sizeof(header)))
+    {
+        return false;
+    }
+
+    if (memcmp(header, "KOYA", 4) != 0)
+    {
+        ESP_LOGE(TAG, "Invalid packet magic from PC");
+        return false;
+    }
+
+    uint8_t type = header[4];
+    uint32_t payload_len =
+        ((uint32_t)header[5] << 16) |
+        ((uint32_t)header[6] << 8) |
+        (uint32_t)header[7];
+
+    if (type == STREAM_TYPE_PLAY_START)
+    {
+        if (payload_len != 0)
+        {
+            ESP_LOGE(TAG, "PLAY_START payload must be empty");
+            return false;
+        }
+
+        esp_err_t err = koyoda_audio_duplex_playback_start();
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Could not start remote playback: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        *playback_open = true;
+        ESP_LOGI(TAG, "AI REPLY RX START");
+        return true;
+    }
+
+    if (type == STREAM_TYPE_PLAY_PCM)
+    {
+        if (payload_len == 0 ||
+            payload_len > STREAM_RX_MAX_BYTES ||
+            (payload_len & 1U) != 0U)
+        {
+            ESP_LOGE(TAG, "Invalid PLAY_PCM length=%lu", (unsigned long)payload_len);
+            return false;
+        }
+
+        int16_t samples[STREAM_PCM_SAMPLES_PER_MSG];
+
+        if (!recv_all(sock, samples, payload_len))
+        {
+            return false;
+        }
+
+        esp_err_t err = koyoda_audio_duplex_playback_write(
+            samples,
+            payload_len / sizeof(int16_t));
+
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Could not queue remote PCM: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        return true;
+    }
+
+    if (type == STREAM_TYPE_PLAY_END)
+    {
+        if (payload_len != 0)
+        {
+            ESP_LOGE(TAG, "PLAY_END payload must be empty");
+            return false;
+        }
+
+        esp_err_t err = koyoda_audio_duplex_playback_end();
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Could not end remote playback: %s", esp_err_to_name(err));
+            return false;
+        }
+
+        *playback_open = false;
+        ESP_LOGI(TAG, "AI REPLY RX END");
+        return true;
+    }
+
+    ESP_LOGE(
+        TAG,
+        "Unexpected PC packet type=%u len=%lu",
+        (unsigned)type,
+        (unsigned long)payload_len);
+
+    return false;
 }
 
 static int connect_receiver(void)
@@ -175,17 +302,36 @@ static int connect_receiver(void)
     return sock;
 }
 
+static void close_stream_socket(
+    int *sock,
+    bool *playback_open)
+{
+    if (*playback_open)
+    {
+        /* Unblock the audio owner if the network died mid-reply. */
+        (void)koyoda_audio_duplex_playback_end();
+        *playback_open = false;
+    }
+
+    if (*sock >= 0)
+    {
+        close(*sock);
+        *sock = -1;
+    }
+}
+
 static void stream_task(void *arg)
 {
     (void)arg;
 
     ESP_LOGI(
         TAG,
-        "STREAM STEP1 ready -> %s:%d",
+        "STREAM AI-06 duplex ready -> %s:%d",
         CONFIG_KOYODA_STREAM_HOST,
         CONFIG_KOYODA_STREAM_PORT);
 
     int sock = -1;
+    bool playback_open = false;
     uint64_t utterance_bytes = 0;
     TickType_t utterance_start = 0;
 
@@ -193,11 +339,22 @@ static void stream_task(void *arg)
     {
         stream_msg_t msg;
 
-        if (xQueueReceive(s_queue, &msg, portMAX_DELAY) != pdTRUE)
-            continue;
+        TickType_t wait =
+            (sock < 0)
+                ? portMAX_DELAY
+                : pdMS_TO_TICKS(5);
+
+        BaseType_t got_msg = xQueueReceive(s_queue, &msg, wait);
 
         if (sock < 0)
         {
+            /* Keep the original behavior: connect only when speech gives us
+             * something useful to send. */
+            if (got_msg != pdTRUE)
+            {
+                continue;
+            }
+
             sock = connect_receiver();
 
             if (sock < 0)
@@ -213,57 +370,93 @@ static void stream_task(void *arg)
                 continue;
             }
 
-            ESP_LOGI(TAG, "TCP connected to receiver");
+            ESP_LOGI(TAG, "TCP connected to receiver (full duplex)");
         }
 
-        bool ok = true;
-
-        if (msg.type == STREAM_TYPE_START)
+        if (got_msg == pdTRUE)
         {
-            utterance_bytes = 0;
-            utterance_start = xTaskGetTickCount();
-            ok = send_packet(sock, STREAM_TYPE_START, NULL, 0);
-            ESP_LOGI(TAG, "VOICE STREAM START");
+            bool ok = true;
+
+            if (msg.type == STREAM_TYPE_START)
+            {
+                utterance_bytes = 0;
+                utterance_start = xTaskGetTickCount();
+                ok = send_packet(sock, STREAM_TYPE_START, NULL, 0);
+                ESP_LOGI(TAG, "VOICE STREAM START");
+            }
+            else if (msg.type == STREAM_TYPE_PCM)
+            {
+                uint32_t bytes =
+                    (uint32_t)msg.sample_count * sizeof(int16_t);
+
+                ok = send_packet(
+                    sock,
+                    STREAM_TYPE_PCM,
+                    msg.samples,
+                    bytes);
+
+                if (ok)
+                    utterance_bytes += bytes;
+            }
+            else if (msg.type == STREAM_TYPE_END)
+            {
+                ok = send_packet(sock, STREAM_TYPE_END, NULL, 0);
+
+                uint32_t duration_ms =
+                    (uint32_t)(
+                        (xTaskGetTickCount() - utterance_start) *
+                        portTICK_PERIOD_MS);
+
+                ESP_LOGI(
+                    TAG,
+                    "VOICE STREAM END duration=%lums bytes=%llu dropped=%lu",
+                    (unsigned long)duration_ms,
+                    (unsigned long long)utterance_bytes,
+                    (unsigned long)s_dropped_frames);
+            }
+
+            if (!ok)
+            {
+                ESP_LOGW(
+                    TAG,
+                    "Socket send failed errno=%d; closing connection",
+                    errno);
+                close_stream_socket(&sock, &playback_open);
+                continue;
+            }
         }
-        else if (msg.type == STREAM_TYPE_PCM)
+
+        if (sock >= 0)
         {
-            uint32_t bytes =
-                (uint32_t)msg.sample_count * sizeof(int16_t);
+            fd_set readfds;
+            FD_ZERO(&readfds);
+            FD_SET(sock, &readfds);
 
-            ok = send_packet(
-                sock,
-                STREAM_TYPE_PCM,
-                msg.samples,
-                bytes);
+            struct timeval tv = {
+                .tv_sec = 0,
+                .tv_usec = 0,
+            };
 
-            if (ok)
-                utterance_bytes += bytes;
-        }
-        else if (msg.type == STREAM_TYPE_END)
-        {
-            ok = send_packet(sock, STREAM_TYPE_END, NULL, 0);
+            int ready = select(sock + 1, &readfds, NULL, NULL, &tv);
 
-            uint32_t duration_ms =
-                (uint32_t)(
-                    (xTaskGetTickCount() - utterance_start) *
-                    portTICK_PERIOD_MS);
+            if (ready < 0)
+            {
+                ESP_LOGW(TAG, "Socket select failed errno=%d", errno);
+                close_stream_socket(&sock, &playback_open);
+                continue;
+            }
 
-            ESP_LOGI(
-                TAG,
-                "VOICE STREAM END duration=%lums bytes=%llu dropped=%lu",
-                (unsigned long)duration_ms,
-                (unsigned long long)utterance_bytes,
-                (unsigned long)s_dropped_frames);
-        }
-
-        if (!ok)
-        {
-            ESP_LOGW(
-                TAG,
-                "Socket send failed errno=%d; closing connection",
-                errno);
-            close(sock);
-            sock = -1;
+            if (ready > 0 && FD_ISSET(sock, &readfds))
+            {
+                if (!receive_playback_packet(sock, &playback_open))
+                {
+                    ESP_LOGW(
+                        TAG,
+                        "Reply receive failed/disconnected errno=%d; closing connection",
+                        errno);
+                    close_stream_socket(&sock, &playback_open);
+                }
+            }
         }
     }
 }
