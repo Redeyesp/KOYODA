@@ -32,6 +32,10 @@ static const char *TAG = "KOYODA_WIFI";
 #define WIFI_SETUP_SUCCESS_HOLD_MS      3000U
 #define WIFI_TEST_TIMEOUT_MS            15000U
 #define WIFI_SCAN_MAX_AP                12
+#define WIFI_SCAN_FIRST_CHANNEL         1
+#define WIFI_SCAN_LAST_CHANNEL          13
+#define WIFI_SCAN_ACTIVE_MIN_MS         25
+#define WIFI_SCAN_ACTIVE_MAX_MS         50
 
 #define WIFI_TEST_GOT_IP_BIT            BIT0
 #define WIFI_TEST_DISCONNECTED_BIT      BIT1
@@ -73,6 +77,7 @@ static volatile bool s_scan_requested = false;
 static volatile bool s_scan_in_progress = false;
 static volatile bool s_scan_done_pending = false;
 static volatile bool s_scan_ready = false;
+static volatile uint8_t s_scan_channel = WIFI_SCAN_FIRST_CHANNEL;
 
 /* ------------------------------------------------------------------------- */
 /* Small shared-state helpers.                                               */
@@ -292,6 +297,15 @@ static void wifi_event_handler(void *arg,
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
     {
+        /* Entering APSTA for phone setup must not kick off a fresh STA
+         * association.  A connect-in-progress prevents esp_wifi_scan_start().
+         * Keep any already-established STA link, but do not start a new one. */
+        if (s_provisioning && !s_testing_credentials)
+        {
+            ESP_LOGI(TAG, "Provisioning active; STA start will not auto-connect");
+            return;
+        }
+
         char ssid[33];
         char password[65];
         if (copy_active_credentials(ssid, sizeof(ssid), password, sizeof(password)))
@@ -325,13 +339,14 @@ static void wifi_event_handler(void *arg,
             return;
         }
 
-        /* While the phone setup portal is open, deliberately keep the STA
-         * idle.  esp_wifi_scan_start() returns ESP_ERR_WIFI_STATE when the
-         * station is CONNECTING, so the normal auto-reconnect loop would
-         * otherwise starve portal discovery if the previous AP is absent. */
+        /* During phone setup, do not immediately reconnect the old STA.
+         * If the old AP is absent, that reconnect loop keeps the radio in
+         * CONNECTING and every portal scan is rejected with
+         * ESP_ERR_WIFI_STATE.  We do NOT force a disconnect here; an existing
+         * good STA connection is allowed to remain up. */
         if (s_provisioning)
         {
-            ESP_LOGI(TAG, "Provisioning active; STA auto-reconnect paused for scan");
+            ESP_LOGI(TAG, "Provisioning active; STA reconnect paused");
             return;
         }
 
@@ -386,38 +401,76 @@ static int compare_ap_rssi(const void *a, const void *b)
     return (int)bb->rssi - (int)aa->rssi;
 }
 
+static void finish_incremental_scan(void)
+{
+    if (s_scan_count > 1)
+    {
+        qsort(s_scan_records, s_scan_count, sizeof(s_scan_records[0]), compare_ap_rssi);
+    }
+
+    s_scan_requested = false;
+    s_scan_in_progress = false;
+    s_scan_done_pending = false;
+    s_scan_ready = true;
+    ESP_LOGI(TAG, "Incremental portal scan complete: %u network(s)",
+             (unsigned)s_scan_count);
+}
+
 static esp_err_t start_network_scan_async(void)
 {
-    /* Deliberately non-blocking and use the ESP-IDF default scan dwell
-     * parameters.  The old 20-40 ms/channel window was unnecessarily short
-     * and could miss AP beacons.  NULL means active all-channel scan with
-     * the driver's tested defaults (including home-channel dwell). */
+    /* SAFE v2.3: scan ONE channel per request, then yield back to LVGL/Wi-Fi.
+     * A long all-channel scan was visibly starving this board's display path.
+     * Active probe scans are short, while the 250 ms provisioning loop gives
+     * the radio/UI breathing room between channels. */
+    if (s_scan_channel > WIFI_SCAN_LAST_CHANNEL)
+    {
+        finish_incremental_scan();
+        return ESP_OK;
+    }
+
+    wifi_scan_config_t scan = {0};
+    scan.show_hidden = false;
+    scan.channel = s_scan_channel;
+    scan.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+    scan.scan_time.active.min = WIFI_SCAN_ACTIVE_MIN_MS;
+    scan.scan_time.active.max = WIFI_SCAN_ACTIVE_MAX_MS;
+    scan.home_chan_dwell_time = 30;
+
     s_scan_requested = false;
-    s_scan_count = 0;
-    s_scan_ready = false;
     s_scan_done_pending = false;
 
-    esp_err_t ret = esp_wifi_scan_start(NULL, false);
+    esp_err_t ret = esp_wifi_scan_start(&scan, false);
     if (ret == ESP_OK)
     {
         s_scan_in_progress = true;
-        ESP_LOGI(TAG, "Portal-triggered async Wi-Fi scan started (IDF defaults)");
+        ESP_LOGI(TAG, "Incremental portal scan: channel %u/%u",
+                 (unsigned)s_scan_channel, (unsigned)WIFI_SCAN_LAST_CHANNEL);
     }
     else if (ret == ESP_ERR_WIFI_STATE)
     {
-        /* A connect may have been finishing as provisioning started. Retry
-         * from the low-priority provisioning loop instead of publishing a
-         * false '0 networks found' result. */
+        /* Never disconnect just to make scanning work. A previous association
+         * may still be finishing. Leave the UI/AP alone and retry later. */
         s_scan_in_progress = false;
         s_scan_requested = true;
-        s_scan_ready = false;
-        ESP_LOGW(TAG, "Wi-Fi busy connecting; portal scan will retry");
+        ESP_LOGI(TAG, "STA still connecting; defer scan channel %u",
+                 (unsigned)s_scan_channel);
     }
     else
     {
+        /* Do not wedge provisioning on one bad channel/error. Skip it and
+         * continue the incremental scan on the next provisioning-loop tick. */
         s_scan_in_progress = false;
-        s_scan_ready = true;
-        ESP_LOGW(TAG, "Portal Wi-Fi scan could not start: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "Scan channel %u failed: %s",
+                 (unsigned)s_scan_channel, esp_err_to_name(ret));
+        s_scan_channel++;
+        if (s_scan_channel > WIFI_SCAN_LAST_CHANNEL)
+        {
+            finish_incremental_scan();
+        }
+        else
+        {
+            s_scan_requested = true;
+        }
     }
     return ret;
 }
@@ -433,45 +486,58 @@ static void collect_scan_results(void)
     esp_err_t ret = esp_wifi_scan_get_ap_records(&count, records);
     if (ret != ESP_OK)
     {
-        ESP_LOGW(TAG, "Could not read async scan results: %s", esp_err_to_name(ret));
-        s_scan_count = 0;
-        s_scan_ready = true;
-        return;
+        ESP_LOGW(TAG, "Could not read scan channel %u: %s",
+                 (unsigned)s_scan_channel, esp_err_to_name(ret));
+        /* Clear driver-owned scan memory if record retrieval failed. */
+        esp_wifi_clear_ap_list();
     }
-
-    qsort(records, count, sizeof(records[0]), compare_ap_rssi);
-
-    uint16_t out = 0;
-    memset(s_scan_records, 0, sizeof(s_scan_records));
-    for (uint16_t i = 0; i < count; ++i)
+    else
     {
-        if (records[i].ssid[0] == '\0')
+        for (uint16_t i = 0; i < count; ++i)
         {
-            continue;
-        }
-
-        bool duplicate = false;
-        for (uint16_t j = 0; j < out; ++j)
-        {
-            if (strncmp((const char *)s_scan_records[j].ssid,
-                        (const char *)records[i].ssid,
-                        sizeof(records[i].ssid)) == 0)
+            if (records[i].ssid[0] == '\0')
             {
-                duplicate = true;
-                break;
+                continue;
+            }
+
+            int existing = -1;
+            for (uint16_t j = 0; j < s_scan_count; ++j)
+            {
+                if (strncmp((const char *)s_scan_records[j].ssid,
+                            (const char *)records[i].ssid,
+                            sizeof(records[i].ssid)) == 0)
+                {
+                    existing = (int)j;
+                    break;
+                }
+            }
+
+            if (existing >= 0)
+            {
+                if (records[i].rssi > s_scan_records[existing].rssi)
+                {
+                    s_scan_records[existing] = records[i];
+                }
+            }
+            else if (s_scan_count < WIFI_SCAN_MAX_AP)
+            {
+                s_scan_records[s_scan_count++] = records[i];
             }
         }
-
-        if (!duplicate && out < WIFI_SCAN_MAX_AP)
-        {
-            s_scan_records[out++] = records[i];
-        }
     }
 
-    /* Publish count/ready last so the HTTP task never walks half-written data. */
-    s_scan_count = out;
-    s_scan_ready = true;
-    ESP_LOGI(TAG, "Portal scan found %u network(s)", (unsigned)out);
+    s_scan_in_progress = false;
+    s_scan_channel++;
+
+    if (s_scan_channel > WIFI_SCAN_LAST_CHANNEL)
+    {
+        finish_incremental_scan();
+    }
+    else
+    {
+        /* Let the provisioning loop yield ~250 ms before the next channel. */
+        s_scan_requested = true;
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -627,6 +693,11 @@ static esp_err_t portal_root_get(httpd_req_t *req)
     if (!s_scan_ready && !s_scan_in_progress && !s_scan_requested &&
         !s_testing_credentials)
     {
+        if (s_scan_channel < WIFI_SCAN_FIRST_CHANNEL ||
+            s_scan_channel > WIFI_SCAN_LAST_CHANNEL)
+        {
+            s_scan_channel = WIFI_SCAN_FIRST_CHANNEL;
+        }
         s_scan_requested = true;
     }
 
@@ -640,9 +711,11 @@ static esp_err_t portal_root_get(httpd_req_t *req)
 
     if (!scan_ready)
     {
-        httpd_resp_send_chunk(req,
-            "<option value=''>Scanning nearby networks...</option>",
-            HTTPD_RESP_USE_STRLEN);
+        char scanning_option[128];
+        snprintf(scanning_option, sizeof(scanning_option),
+                 "<option value=''>Scanning nearby networks... channel %u/%u</option>",
+                 (unsigned)s_scan_channel, (unsigned)WIFI_SCAN_LAST_CHANNEL);
+        httpd_resp_send_chunk(req, scanning_option, HTTPD_RESP_USE_STRLEN);
     }
     else if (scan_count == 0)
     {
@@ -679,7 +752,7 @@ static esp_err_t portal_root_get(httpd_req_t *req)
         "<input name='ssid_manual' maxlength='32' autocomplete='off' placeholder='Type SSID only if it is not listed'>"
         "<label>Password</label><input name='password' type='password' maxlength='64' autocomplete='new-password' placeholder='Leave blank for an open network'>"
         "<button type='submit'>CONNECT KOYODA</button></form>"
-        "<p class='small'>The hotspot starts first. KOYODA pauses its old Wi-Fi connection while scanning, then lists nearby 2.4 GHz networks. A new network is saved only after KOYODA obtains an IP address.</p>"
+        "<p class='small'>The hotspot starts first. KOYODA scans one 2.4 GHz channel at a time after this page is opened so the display stays responsive. A new network is saved only after KOYODA obtains an IP address.</p>"
         "</div></div>";
 
     httpd_resp_send_chunk(req, tail, HTTPD_RESP_USE_STRLEN);
@@ -965,6 +1038,8 @@ static void provisioning_task(void *arg)
      * On this board the Wi-Fi driver and LVGL/display share CPU0, and a
      * blocking scan can starve the UI before the phone hotspot exists. */
     s_scan_count = 0;
+    memset(s_scan_records, 0, sizeof(s_scan_records));
+    s_scan_channel = WIFI_SCAN_FIRST_CHANNEL;
     s_scan_requested = false;
     s_scan_in_progress = false;
     s_scan_done_pending = false;
@@ -984,20 +1059,6 @@ static void provisioning_task(void *arg)
     /* Give the Wi-Fi driver one scheduler slice to start AP beacons before
      * starting the HTTP server. This is asynchronous and does not touch LVGL. */
     vTaskDelay(pdMS_TO_TICKS(200));
-
-    /* Keep APSTA mode, but park the STA before portal discovery. This avoids
-     * scan-vs-connect contention while KOYODA-Setup remains visible to the
-     * phone. Old credentials stay in RAM/NVS and are restored on exit/fail. */
-    esp_err_t disc_ret = esp_wifi_disconnect();
-    if (disc_ret == ESP_OK)
-    {
-        ESP_LOGI(TAG, "STA disconnected for clean provisioning scan");
-        vTaskDelay(pdMS_TO_TICKS(150));
-    }
-    else
-    {
-        ESP_LOGI(TAG, "STA already idle for provisioning scan: %s", esp_err_to_name(disc_ret));
-    }
 
     esp_netif_ip_info_t ap_ip = {0};
     if (s_ap_netif != NULL && esp_netif_get_ip_info(s_ap_netif, &ap_ip) == ESP_OK)
