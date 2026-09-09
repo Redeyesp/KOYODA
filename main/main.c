@@ -47,7 +47,6 @@ static lv_obj_t *wifi_page = NULL;
 static lv_obj_t *wifi_status_label = NULL;
 static lv_obj_t *wifi_detail_label = NULL;
 static lv_obj_t *wifi_rssi_label = NULL;
-static lv_obj_t *wifi_access_label = NULL;
 static lv_obj_t *wifi_change_button = NULL;
 static lv_obj_t *wifi_change_button_label = NULL;
 static lv_obj_t *wifi_signal_bars[4] = {NULL, NULL, NULL, NULL};
@@ -438,11 +437,6 @@ static void update_wifi_ui_locked(void)
     {
         set_wifi_bar_level_locked(0);
 
-        if (wifi_access_label != NULL)
-        {
-            lv_obj_clear_flag(wifi_access_label, LV_OBJ_FLAG_HIDDEN);
-        }
-
         if (setup_state == KOYODA_WIFI_SETUP_TESTING)
         {
             lv_label_set_text(wifi_status_label, "TESTING...");
@@ -482,11 +476,6 @@ static void update_wifi_ui_locked(void)
     if (wifi_change_button_label != NULL)
     {
         lv_label_set_text(wifi_change_button_label, "CHANGE WI-FI");
-    }
-
-    if (wifi_access_label != NULL)
-    {
-        lv_obj_add_flag(wifi_access_label, LV_OBJ_FLAG_HIDDEN);
     }
 
     if (!connected)
@@ -672,26 +661,9 @@ static void create_wifi_page(lv_obj_t *screen)
         0,
         126);
 
-    wifi_access_label = lv_label_create(wifi_page);
-    lv_label_set_text(wifi_access_label, "Please access 192.168.4.1 on your phone");
-    lv_obj_set_style_text_color(
-        wifi_access_label,
-        lv_color_hex(0x888888),
-        0);
-    lv_obj_set_style_text_font(
-        wifi_access_label,
-        &lv_font_montserrat_14,
-        0);
-    lv_obj_align(
-        wifi_access_label,
-        LV_ALIGN_CENTER,
-        0,
-        145);
-    lv_obj_add_flag(wifi_access_label, LV_OBJ_FLAG_HIDDEN);
-
     wifi_change_button = lv_button_create(wifi_page);
     lv_obj_set_size(wifi_change_button, 190, 54);
-    lv_obj_align(wifi_change_button, LV_ALIGN_CENTER, 0, 184);
+    lv_obj_align(wifi_change_button, LV_ALIGN_CENTER, 0, 174);
     lv_obj_set_style_radius(wifi_change_button, 18, 0);
     lv_obj_set_style_bg_color(wifi_change_button, lv_color_hex(0x17272D), 0);
     lv_obj_set_style_border_width(wifi_change_button, 2, 0);
