@@ -32,6 +32,8 @@ static const char *TAG = "KOYODA_WIFI";
 #define WIFI_SETUP_SUCCESS_HOLD_MS      3000U
 #define WIFI_TEST_TIMEOUT_MS            15000U
 #define WIFI_SCAN_MAX_AP                12
+#define WIFI_HELPER_CORE                1
+#define WIFI_HELPER_PRIORITY            1
 
 #define WIFI_TEST_GOT_IP_BIT            BIT0
 #define WIFI_TEST_DISCONNECTED_BIT      BIT1
@@ -68,7 +70,10 @@ static TaskHandle_t s_provision_task = NULL;
 static TaskHandle_t s_apply_task = NULL;
 
 static wifi_ap_record_t s_scan_records[WIFI_SCAN_MAX_AP];
-static uint16_t s_scan_count = 0;
+static volatile uint16_t s_scan_count = 0;
+static volatile bool s_scan_in_progress = false;
+static volatile bool s_scan_done_pending = false;
+static volatile bool s_scan_ready = false;
 
 /* ------------------------------------------------------------------------- */
 /* Small shared-state helpers.                                               */
@@ -274,6 +279,18 @@ static void wifi_event_handler(void *arg,
 {
     (void)arg;
 
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE)
+    {
+        /* Keep the event-loop callback tiny. The low-priority provisioning
+         * task copies/sorts the records on its next iteration. */
+        s_scan_in_progress = false;
+        if (!s_testing_credentials)
+        {
+            s_scan_done_pending = true;
+        }
+        return;
+    }
+
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
     {
         char ssid[33];
@@ -360,34 +377,62 @@ static int compare_ap_rssi(const void *a, const void *b)
     return (int)bb->rssi - (int)aa->rssi;
 }
 
-static void scan_networks(void)
+static esp_err_t start_network_scan_async(void)
 {
+    /* Short active dwell times keep the scan useful without monopolising the
+     * Wi-Fi radio for several seconds. It is asynchronous: this function
+     * returns immediately and the UI task is never blocked waiting for it. */
     wifi_scan_config_t scan = {0};
-    esp_err_t ret = esp_wifi_scan_start(&scan, true);
-    if (ret != ESP_OK)
+    scan.show_hidden = false;
+    scan.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+    scan.scan_time.active.min = 30;
+    scan.scan_time.active.max = 60;
+
+    s_scan_count = 0;
+    s_scan_ready = false;
+    s_scan_done_pending = false;
+
+    esp_err_t ret = esp_wifi_scan_start(&scan, false);
+    if (ret == ESP_OK)
     {
-        ESP_LOGW(TAG, "Wi-Fi scan failed: %s", esp_err_to_name(ret));
-        s_scan_count = 0;
-        return;
+        s_scan_in_progress = true;
+        ESP_LOGI(TAG, "Nearby Wi-Fi scan started asynchronously");
     }
+    else
+    {
+        s_scan_in_progress = false;
+        s_scan_ready = true;
+        ESP_LOGW(TAG, "Wi-Fi async scan could not start: %s", esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+static void collect_scan_results(void)
+{
+    s_scan_done_pending = false;
 
     uint16_t count = WIFI_SCAN_MAX_AP;
-    memset(s_scan_records, 0, sizeof(s_scan_records));
-    ret = esp_wifi_scan_get_ap_records(&count, s_scan_records);
+    wifi_ap_record_t records[WIFI_SCAN_MAX_AP];
+    memset(records, 0, sizeof(records));
+
+    esp_err_t ret = esp_wifi_scan_get_ap_records(&count, records);
     if (ret != ESP_OK)
     {
-        ESP_LOGW(TAG, "Could not read scan results: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "Could not read async scan results: %s", esp_err_to_name(ret));
         s_scan_count = 0;
+        s_scan_ready = true;
         return;
     }
 
-    qsort(s_scan_records, count, sizeof(s_scan_records[0]), compare_ap_rssi);
+    qsort(records, count, sizeof(records[0]), compare_ap_rssi);
 
-    /* De-duplicate SSIDs in place, strongest first. */
+    /* De-duplicate SSIDs, strongest first. Write the published count LAST so
+     * the HTTP task never iterates a half-written list. */
     uint16_t out = 0;
+    memset(s_scan_records, 0, sizeof(s_scan_records));
     for (uint16_t i = 0; i < count; ++i)
     {
-        if (s_scan_records[i].ssid[0] == '\0')
+        if (records[i].ssid[0] == '\0')
         {
             continue;
         }
@@ -396,26 +441,23 @@ static void scan_networks(void)
         for (uint16_t j = 0; j < out; ++j)
         {
             if (strncmp((const char *)s_scan_records[j].ssid,
-                        (const char *)s_scan_records[i].ssid,
-                        sizeof(s_scan_records[i].ssid)) == 0)
+                        (const char *)records[i].ssid,
+                        sizeof(records[i].ssid)) == 0)
             {
                 duplicate = true;
                 break;
             }
         }
 
-        if (!duplicate)
+        if (!duplicate && out < WIFI_SCAN_MAX_AP)
         {
-            if (out != i)
-            {
-                s_scan_records[out] = s_scan_records[i];
-            }
-            ++out;
+            s_scan_records[out++] = records[i];
         }
     }
 
     s_scan_count = out;
-    ESP_LOGI(TAG, "Provisioning scan found %u network(s)", (unsigned)s_scan_count);
+    s_scan_ready = true;
+    ESP_LOGI(TAG, "Async provisioning scan found %u network(s)", (unsigned)out);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -538,7 +580,7 @@ static const char *setup_state_message(void)
     switch (koyoda_wifi_get_setup_state())
     {
         case KOYODA_WIFI_SETUP_STARTING: return "Starting setup hotspot...";
-        case KOYODA_WIFI_SETUP_READY: return "Setup hotspot is ready. Type your 2.4 GHz Wi-Fi below.";
+        case KOYODA_WIFI_SETUP_READY: return "Setup hotspot is ready. Choose a 2.4 GHz Wi-Fi below.";
         case KOYODA_WIFI_SETUP_TESTING: return "Testing the new Wi-Fi. Please wait...";
         case KOYODA_WIFI_SETUP_FAILED: return "Connection failed. Your old Wi-Fi was kept; check the password and try again.";
         case KOYODA_WIFI_SETUP_SUCCESS: return "Connected and saved. KOYODA is closing setup mode.";
@@ -560,25 +602,74 @@ static esp_err_t portal_root_get(httpd_req_t *req)
         "h1{margin:0 0 6px;color:#67f3ef;font-size:28px}.sub{color:#9db4bb;margin:0 0 20px}.status{background:#102a31;border-radius:14px;padding:13px 14px;margin:14px 0;color:#dff}"
         "label{display:block;margin:15px 0 6px;font-weight:650}select,input{width:100%;box-sizing:border-box;padding:14px;border-radius:12px;border:1px solid #31515a;background:#071015;color:white;font-size:16px}"
         "button{width:100%;padding:15px;margin-top:20px;border:0;border-radius:14px;background:#43d9d4;color:#042025;font-size:17px;font-weight:800}"
-        ".small{font-size:13px;color:#8ea6ad;line-height:1.45}.links{text-align:center;margin-top:16px}.links a{color:#67f3ef;text-decoration:none}.rssi{color:#91abb2;font-size:12px}"
+        ".small{font-size:13px;color:#8ea6ad;line-height:1.45}.rssi{color:#91abb2;font-size:12px}"
         "</style></head><body><div class='wrap'><div class='card'>"
         "<h1>KOYODA Wi-Fi</h1><p class='sub'>Connect KOYODA to a new network</p><div class='status'>";
 
     httpd_resp_send_chunk(req, head, HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(req, setup_state_message(), HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(req,
-        "</div><form method='post' action='/save'>"
-        "<label>Wi-Fi name (SSID)</label>"
-        "<input name='ssid_manual' maxlength='32' autocomplete='off' placeholder='Type the 2.4 GHz Wi-Fi name'>",
+        "</div><form method='post' action='/save'><label>Nearby Wi-Fi</label><select name='ssid'>",
         HTTPD_RESP_USE_STRLEN);
 
+    const bool scan_ready = s_scan_ready;
+    const uint16_t scan_count = s_scan_count;
+
+    if (!scan_ready)
+    {
+        httpd_resp_send_chunk(req,
+            "<option value=''>Scanning nearby networks...</option>",
+            HTTPD_RESP_USE_STRLEN);
+    }
+    else if (scan_count == 0)
+    {
+        httpd_resp_send_chunk(req,
+            "<option value=''>No network found - type SSID below</option>",
+            HTTPD_RESP_USE_STRLEN);
+    }
+    else
+    {
+        for (uint16_t i = 0; i < scan_count && i < WIFI_SCAN_MAX_AP; ++i)
+        {
+            char ssid[33] = {0};
+            size_t n = strnlen((const char *)s_scan_records[i].ssid,
+                               sizeof(s_scan_records[i].ssid));
+            if (n > 32) n = 32;
+            memcpy(ssid, s_scan_records[i].ssid, n);
+
+            char escaped[192];
+            html_escape(ssid, escaped, sizeof(escaped));
+
+            const char *security =
+                (s_scan_records[i].authmode == WIFI_AUTH_OPEN) ? "open" : "locked";
+            char option[320];
+            snprintf(option, sizeof(option),
+                     "<option value=\"%s\">%s  ·  %d dBm  ·  %s</option>",
+                     escaped, escaped, (int)s_scan_records[i].rssi, security);
+            httpd_resp_send_chunk(req, option, HTTPD_RESP_USE_STRLEN);
+        }
+    }
+
     static const char *tail =
+        "</select><label>Other / hidden Wi-Fi <span class='rssi'>(optional)</span></label>"
+        "<input name='ssid_manual' maxlength='32' autocomplete='off' placeholder='Type SSID only if it is not listed'>"
         "<label>Password</label><input name='password' type='password' maxlength='64' autocomplete='new-password' placeholder='Leave blank for an open network'>"
         "<button type='submit'>CONNECT KOYODA</button></form>"
-        "<p class='small'>AP-FIRST stability mode: nearby-network scanning is intentionally disabled. Type the SSID exactly as shown on your phone/router. KOYODA supports 2.4 GHz Wi-Fi. A new network is saved only after KOYODA successfully obtains an IP address.</p>"
-        "</div></div></body></html>";
+        "<p class='small'>KOYODA scans 2.4 GHz Wi-Fi in the background. If the list still says scanning, refresh this page after a moment. A new network is saved only after KOYODA gets a real IP address; a failed password keeps the previous network.</p>"
+        "</div></div>";
 
     httpd_resp_send_chunk(req, tail, HTTPD_RESP_USE_STRLEN);
+
+    if (!scan_ready)
+    {
+        /* One lightweight auto-refresh normally replaces the scanning row with
+         * the dropdown list before the user has typed a password. */
+        httpd_resp_send_chunk(req,
+            "<script>setTimeout(function(){location.reload();},1200);</script>",
+            HTTPD_RESP_USE_STRLEN);
+    }
+
+    httpd_resp_send_chunk(req, "</body></html>", HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
@@ -601,6 +692,14 @@ static void apply_new_credentials_task(void *arg)
 
     set_setup_state(KOYODA_WIFI_SETUP_TESTING);
     s_testing_credentials = true;
+
+    /* Never let a background portal scan overlap the association test. */
+    if (s_scan_in_progress)
+    {
+        esp_wifi_scan_stop();
+        s_scan_in_progress = false;
+        s_scan_done_pending = false;
+    }
 
     xEventGroupClearBits(s_test_events,
                          WIFI_TEST_GOT_IP_BIT | WIFI_TEST_DISCONNECTED_BIT);
@@ -718,13 +817,14 @@ static esp_err_t portal_save_post(httpd_req_t *req)
     strlcpy(s_pending_password, password, sizeof(s_pending_password));
     portEXIT_CRITICAL(&s_state_mux);
 
-    BaseType_t created = xTaskCreate(
+    BaseType_t created = xTaskCreatePinnedToCore(
         apply_new_credentials_task,
         "wifi_apply",
         4096,
         NULL,
-        1,
-        &s_apply_task);
+        WIFI_HELPER_PRIORITY,
+        &s_apply_task,
+        WIFI_HELPER_CORE);
 
     if (created != pdPASS)
     {
@@ -762,6 +862,10 @@ static esp_err_t start_http_server(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    /* Portal work belongs on CPU1. CPU0 owns LVGL/display and the ESP Wi-Fi
+     * driver already has unavoidable work there during association. */
+    config.core_id = WIFI_HELPER_CORE;
+    config.task_priority = WIFI_HELPER_PRIORITY;
     config.max_open_sockets = 4;
     config.lru_purge_enable = true;
 
@@ -842,11 +946,12 @@ static void provisioning_task(void *arg)
     set_setup_state(KOYODA_WIFI_SETUP_STARTING);
     s_provision_stop_requested = false;
 
-    /* SAFE v2: AP-FIRST. Never perform a Wi-Fi scan on the setup-start path.
-     * On this board the Wi-Fi driver and LVGL/display share CPU0, and a
-     * blocking scan can starve the UI before the phone hotspot exists. */
+    /* SAFE v3: AP-FIRST. Setup is visible before any scan is attempted. */
     s_scan_count = 0;
-    ESP_LOGI(TAG, "SAFE v2 stage 1/2: enabling KOYODA-Setup immediately");
+    s_scan_ready = false;
+    s_scan_in_progress = false;
+    s_scan_done_pending = false;
+    ESP_LOGI(TAG, "SAFE v3 stage 1/2: enabling KOYODA-Setup immediately");
     esp_err_t ret = enable_setup_ap();
     if (ret != ESP_OK)
     {
@@ -868,7 +973,7 @@ static void provisioning_task(void *arg)
         ESP_LOGI(TAG, "KOYODA-Setup AP IP=" IPSTR, IP2STR(&ap_ip.ip));
     }
 
-    ESP_LOGI(TAG, "SAFE v2 stage 2/2: starting HTTP portal");
+    ESP_LOGI(TAG, "SAFE v3 stage 2/2: starting HTTP portal");
     ret = start_http_server();
 
     if (ret != ESP_OK)
@@ -884,14 +989,24 @@ static void provisioning_task(void *arg)
     }
 
     set_setup_state(KOYODA_WIFI_SETUP_READY);
-    ESP_LOGI(TAG, "SAFE v2 AP-FIRST ready: SSID=%s password=%s manual URL=http://192.168.4.1",
+    ESP_LOGI(TAG, "SAFE v3 AP-FIRST ready: SSID=%s password=%s URL=http://192.168.4.1",
              KOYODA_WIFI_SETUP_AP_SSID,
              KOYODA_WIFI_SETUP_AP_PASSWORD);
+
+    /* AP stays first. The nearby-network list is populated afterwards by one
+     * short asynchronous scan, so starting setup never blocks waiting on it. */
+    vTaskDelay(pdMS_TO_TICKS(100));
+    start_network_scan_async();
 
     TickType_t started_at = xTaskGetTickCount();
 
     while (!s_provision_stop_requested)
     {
+        if (!s_testing_credentials && s_scan_done_pending)
+        {
+            collect_scan_results();
+        }
+
         if (!s_testing_credentials)
         {
             uint32_t elapsed_ms =
@@ -907,6 +1022,12 @@ static void provisioning_task(void *arg)
     }
 
     stop_http_server();
+    if (s_scan_in_progress)
+    {
+        esp_wifi_scan_stop();
+        s_scan_in_progress = false;
+    }
+    s_scan_done_pending = false;
     esp_wifi_set_mode(WIFI_MODE_STA);
 
     s_provisioning = false;
@@ -945,13 +1066,14 @@ esp_err_t koyoda_wifi_begin_provisioning(void)
     s_provisioning = true;
     set_setup_state(KOYODA_WIFI_SETUP_STARTING);
 
-    BaseType_t result = xTaskCreate(
+    BaseType_t result = xTaskCreatePinnedToCore(
         provisioning_task,
         "wifi_setup",
         4096,
         NULL,
-        1,
-        &s_provision_task);
+        WIFI_HELPER_PRIORITY,
+        &s_provision_task,
+        WIFI_HELPER_CORE);
 
     if (result != pdPASS)
     {
@@ -1120,13 +1242,14 @@ esp_err_t koyoda_wifi_start(void)
 
     s_started = true;
 
-    BaseType_t result = xTaskCreate(
+    BaseType_t result = xTaskCreatePinnedToCore(
         wifi_start_task,
         "wifi_start",
         4096,
         NULL,
-        1,
-        NULL);
+        WIFI_HELPER_PRIORITY,
+        NULL,
+        WIFI_HELPER_CORE);
 
     if (result != pdPASS)
     {

@@ -64,6 +64,10 @@ static volatile bool power_dialog_requested = false;
 static volatile bool battery_refresh_requested = false;
 static volatile bool wifi_refresh_requested = false;
 static uint32_t wifi_last_refresh_ms = 0;
+static koyoda_wifi_setup_state_t wifi_last_setup_state = KOYODA_WIFI_SETUP_OFF;
+static bool wifi_last_provisioning = false;
+static bool wifi_last_connected = false;
+static bool wifi_force_full_redraw = false;
 
 /* Real AXP2101 charging-event state.
  * The animation is triggered on a false -> true charging transition.
@@ -1296,8 +1300,7 @@ static void power_button_task(void *arg)
                 long_press_reported = true;
                 /* Never create/delete LVGL objects from the GPIO polling task.
                  * Queue the request and let the main UI loop perform the
-                 * display-locked LVGL work. This avoids timing-dependent
-                 * deadlocks once Wi-Fi/network tasks are active. */
+                 * display-locked LVGL work. */
                 power_dialog_requested = true;
             }
         }
@@ -1321,8 +1324,7 @@ static void power_button_task(void *arg)
  * This prevents two animation tasks from overwriting one another. */
 static void face_animation_step(void)
 {
-    /* Power-button task is not allowed to touch LVGL directly. Process its
-     * request here, on KOYODA's normal UI path, before taking the frame lock. */
+    /* Power-button task is not allowed to touch LVGL directly. */
     if (power_dialog_requested)
     {
         power_dialog_requested = false;
@@ -1339,6 +1341,25 @@ static void face_animation_step(void)
         &koyoda_charge_4, &koyoda_charge_5, &koyoda_charge_6,
         &fun_happy
     };
+    const bool provisioning_now = koyoda_wifi_is_provisioning();
+    const bool connected_now = koyoda_wifi_is_connected();
+    const koyoda_wifi_setup_state_t setup_now = koyoda_wifi_get_setup_state();
+
+    /* A STA scan/connect attempt can briefly starve display service on CPU0.
+     * When the network transition ends, force one full repaint so any partial
+     * DMA/LVGL artefact is replaced instead of remaining on screen. */
+    if ((wifi_last_setup_state == KOYODA_WIFI_SETUP_TESTING &&
+         setup_now != KOYODA_WIFI_SETUP_TESTING) ||
+        (wifi_last_provisioning && !provisioning_now) ||
+        (!wifi_last_connected && connected_now))
+    {
+        wifi_force_full_redraw = true;
+        wifi_refresh_requested = true;
+    }
+    wifi_last_setup_state = setup_now;
+    wifi_last_provisioning = provisioning_now;
+    wifi_last_connected = connected_now;
+
     bsp_display_lock(-1);
 
     uint32_t now_ms = lv_tick_get();
@@ -1351,11 +1372,20 @@ static void face_animation_step(void)
         touch_held,
         &charging_animation_pending);
 
-    if (current_page == PAGE_FACE &&
+    /* During the short credential test, avoid pushing large face frames while
+     * the Wi-Fi driver is busy associating. Navigation and status UI remain live. */
+    if (setup_now != KOYODA_WIFI_SETUP_TESTING &&
+        current_page == PAGE_FACE &&
         !power_dialog_open &&
         lv_image_get_src(face_img) != frames[frame])
     {
         lv_image_set_src(face_img, frames[frame]);
+    }
+
+    if (wifi_force_full_redraw)
+    {
+        lv_obj_invalidate(lv_screen_active());
+        wifi_force_full_redraw = false;
     }
 
     /*
