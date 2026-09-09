@@ -37,15 +37,6 @@ static const char *TAG = "KOYODA_WIFI";
 #define WIFI_SCAN_ACTIVE_MIN_MS         25
 #define WIFI_SCAN_ACTIVE_MAX_MS         50
 
-/* SAFE v2.4: the scan itself is stable. The expensive point is the first
- * HTTP render after results are ready, when the handler builds the SSID
- * dropdown. Give that task its own low-priority CPU1 budget and more stack
- * instead of letting it compete with LVGL/display on CPU0. */
-#define WIFI_PORTAL_CORE                 1
-#define WIFI_PORTAL_TASK_PRIORITY        1
-#define WIFI_PORTAL_STACK_SIZE           8192
-#define WIFI_PORTAL_REFRESH_MS           4500
-
 #define WIFI_TEST_GOT_IP_BIT            BIT0
 #define WIFI_TEST_DISCONNECTED_BIT      BIT1
 
@@ -423,8 +414,6 @@ static void finish_incremental_scan(void)
     s_scan_ready = true;
     ESP_LOGI(TAG, "Incremental portal scan complete: %u network(s)",
              (unsigned)s_scan_count);
-    ESP_LOGI(TAG, "SAFE v2.4: scan complete; HTTP result rendering is isolated on CPU%d",
-             WIFI_PORTAL_CORE);
 }
 
 static esp_err_t start_network_scan_async(void)
@@ -769,11 +758,9 @@ static esp_err_t portal_root_get(httpd_req_t *req)
     httpd_resp_send_chunk(req, tail, HTTPD_RESP_USE_STRLEN);
     if (!scan_ready)
     {
-        char refresh_script[128];
-        snprintf(refresh_script, sizeof(refresh_script),
-                 "<script>setTimeout(function(){location.reload();},%u);</script>",
-                 (unsigned)WIFI_PORTAL_REFRESH_MS);
-        httpd_resp_send_chunk(req, refresh_script, HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send_chunk(req,
+            "<script>setTimeout(function(){location.reload();},1500);</script>",
+            HTTPD_RESP_USE_STRLEN);
     }
     httpd_resp_send_chunk(req, "</body></html>", HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(req, NULL, 0);
@@ -967,16 +954,8 @@ static esp_err_t start_http_server(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    /* Only the portal HTTP task moves off CPU0. Wi-Fi startup, provisioning,
-     * scan state machine and all LVGL code remain exactly on the v2.3 path. */
-    config.core_id = WIFI_PORTAL_CORE;
-    config.task_priority = WIFI_PORTAL_TASK_PRIORITY;
-    config.stack_size = WIFI_PORTAL_STACK_SIZE;
     config.max_open_sockets = 4;
     config.lru_purge_enable = true;
-
-    ESP_LOGI(TAG, "SAFE v2.4 portal: core=%d priority=%d stack=%u",
-             config.core_id, config.task_priority, (unsigned)config.stack_size);
 
     esp_err_t ret = httpd_start(&s_http_server, &config);
     if (ret != ESP_OK)
