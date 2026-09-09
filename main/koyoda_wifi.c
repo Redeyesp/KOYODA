@@ -79,6 +79,13 @@ static volatile bool s_scan_done_pending = false;
 static volatile bool s_scan_ready = false;
 static volatile uint8_t s_scan_channel = WIFI_SCAN_FIRST_CHANNEL;
 
+/* SAFE v2.3.1: keep the larger portal-render buffers out of the HTTP
+ * server task stack. ESP-IDF httpd handles URI callbacks serially in its
+ * server task, so one shared scratch set is enough for this diagnostic. */
+static char s_portal_ssid_buf[33];
+static char s_portal_escaped_buf[192];
+static char s_portal_option_buf[320];
+
 /* ------------------------------------------------------------------------- */
 /* Small shared-state helpers.                                               */
 /* ------------------------------------------------------------------------- */
@@ -727,22 +734,22 @@ static esp_err_t portal_root_get(httpd_req_t *req)
     {
         for (uint16_t i = 0; i < scan_count && i < WIFI_SCAN_MAX_AP; ++i)
         {
-            char ssid[33] = {0};
+            memset(s_portal_ssid_buf, 0, sizeof(s_portal_ssid_buf));
             size_t n = strnlen((const char *)s_scan_records[i].ssid,
                                sizeof(s_scan_records[i].ssid));
             if (n > 32) n = 32;
-            memcpy(ssid, s_scan_records[i].ssid, n);
+            memcpy(s_portal_ssid_buf, s_scan_records[i].ssid, n);
 
-            char escaped[192];
-            html_escape(ssid, escaped, sizeof(escaped));
+            html_escape(s_portal_ssid_buf, s_portal_escaped_buf,
+                        sizeof(s_portal_escaped_buf));
 
             const char *security =
                 (s_scan_records[i].authmode == WIFI_AUTH_OPEN) ? "open" : "locked";
-            char option[320];
-            snprintf(option, sizeof(option),
+            snprintf(s_portal_option_buf, sizeof(s_portal_option_buf),
                      "<option value=\"%s\">%s  ·  %d dBm  ·  %s</option>",
-                     escaped, escaped, (int)s_scan_records[i].rssi, security);
-            httpd_resp_send_chunk(req, option, HTTPD_RESP_USE_STRLEN);
+                     s_portal_escaped_buf, s_portal_escaped_buf,
+                     (int)s_scan_records[i].rssi, security);
+            httpd_resp_send_chunk(req, s_portal_option_buf, HTTPD_RESP_USE_STRLEN);
         }
     }
 
@@ -758,8 +765,12 @@ static esp_err_t portal_root_get(httpd_req_t *req)
     httpd_resp_send_chunk(req, tail, HTTPD_RESP_USE_STRLEN);
     if (!scan_ready)
     {
+        /* SAFE v2.3.1 diagnostic: do NOT auto-refresh while/after the scan.
+         * This separates radio scan completion from the next HTTP render. */
         httpd_resp_send_chunk(req,
-            "<script>setTimeout(function(){location.reload();},1500);</script>",
+            "<div class='links'><a href='/'>SHOW / REFRESH NETWORKS</a></div>"
+            "<p class='small'>Wait about 6-8 seconds for the channel scan to finish, "
+            "then tap SHOW / REFRESH NETWORKS. KOYODA will not reload this page automatically.</p>",
             HTTPD_RESP_USE_STRLEN);
     }
     httpd_resp_send_chunk(req, "</body></html>", HTTPD_RESP_USE_STRLEN);
