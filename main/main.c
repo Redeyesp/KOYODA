@@ -60,6 +60,7 @@ static lv_obj_t *swipe_layer = NULL;
 static esp_io_expander_handle_t io_expander = NULL;
 
 static volatile bool power_dialog_open = false;
+static volatile bool power_dialog_requested = false;
 static volatile bool battery_refresh_requested = false;
 static volatile bool wifi_refresh_requested = false;
 static uint32_t wifi_last_refresh_ms = 0;
@@ -1293,7 +1294,11 @@ static void power_button_task(void *arg)
             {
                 ESP_LOGI(TAG, "PWR LONG PRESS detected");
                 long_press_reported = true;
-                show_power_dialog();
+                /* Never create/delete LVGL objects from the GPIO polling task.
+                 * Queue the request and let the main UI loop perform the
+                 * display-locked LVGL work. This avoids timing-dependent
+                 * deadlocks once Wi-Fi/network tasks are active. */
+                power_dialog_requested = true;
             }
         }
 
@@ -1316,6 +1321,17 @@ static void power_button_task(void *arg)
  * This prevents two animation tasks from overwriting one another. */
 static void face_animation_step(void)
 {
+    /* Power-button task is not allowed to touch LVGL directly. Process its
+     * request here, on KOYODA's normal UI path, before taking the frame lock. */
+    if (power_dialog_requested)
+    {
+        power_dialog_requested = false;
+        if (!power_dialog_open)
+        {
+            show_power_dialog();
+        }
+    }
+
     const lv_image_dsc_t *frames[] = {
         &koyoda_idle, &koyoda_half, &koyoda_closed,
         &koyoda_sleep_1, &koyoda_sleep_2, &koyoda_sleep_3,
