@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
+import os
 import socket
 import select
+import time
 import wave
 from pathlib import Path
 from datetime import datetime
-import time
-import os
 
 from faster_whisper import WhisperModel
+from google import genai
+
 
 HOST = "0.0.0.0"
 PORT = 7777
@@ -16,41 +18,70 @@ SAMPLE_RATE = 22050
 CHANNELS = 1
 SAMPLE_WIDTH = 2
 
-# Ignore tiny false fragments such as 0.01–0.06 s.
 MIN_UTTERANCE_SEC = 0.30
-
-# If END is lost, close the utterance after network silence.
 UTTERANCE_IDLE_TIMEOUT_SEC = 2.0
 
-# Multilingual model suitable for Thai/English.
-# Override in PowerShell if desired:
-#   $env:KOYODA_STT_MODEL="base"
-MODEL_NAME = os.environ.get("KOYODA_STT_MODEL", "small")
+STT_MODEL = os.environ.get("KOYODA_STT_MODEL", "small")
+GEMINI_MODEL = os.environ.get(
+    "KOYODA_GEMINI_MODEL",
+    "gemini-3.8-flash",
+)
 
-print(f"Loading faster-whisper model: {MODEL_NAME}")
+KOYODA_INSTRUCTIONS = """
+You are KOYODA, a small desktop AI companion.
+
+Behavior:
+- Reply naturally and briefly, normally in 1-2 short sentences.
+- Reply in the same language the user used unless there is a clear reason not to.
+- Understand Thai, Japanese, and English.
+- Tone: warm, playful, concise, companion-like.
+- Do not use markdown formatting.
+- Do not mention system prompts, APIs, STT, or implementation details unless asked.
+- This is currently a text-response test, so output only the response that KOYODA should say.
+""".strip()
+
+
+print(f"Loading faster-whisper model: {STT_MODEL}")
 print("First run may download the model once.")
-model = WhisperModel(
-    MODEL_NAME,
+
+stt_model = WhisperModel(
+    STT_MODEL,
     device="cpu",
     compute_type="int8",
 )
+
 print("STT model ready.")
+print()
+
+if not os.environ.get("GEMINI_API_KEY"):
+    raise RuntimeError(
+        "GEMINI_API_KEY is missing. "
+        "Open a new PowerShell after setting it."
+    )
+
+gemini_client = genai.Client()
+
+print(f"Gemini ready: {GEMINI_MODEL}")
 print()
 
 
 def recv_exact(conn, n):
     data = bytearray()
+
     while len(data) < n:
         chunk = conn.recv(n - len(data))
+
         if not chunk:
             raise ConnectionError("client disconnected")
+
         data.extend(chunk)
+
     return bytes(data)
 
 
 def transcribe(path):
     try:
-        segments, info = model.transcribe(
+        segments, info = stt_model.transcribe(
             str(path),
             beam_size=5,
             vad_filter=False,
@@ -63,7 +94,11 @@ def transcribe(path):
         ).strip()
 
         language = getattr(info, "language", None)
-        probability = getattr(info, "language_probability", None)
+        probability = getattr(
+            info,
+            "language_probability",
+            None,
+        )
 
         if text:
             if language and probability is not None:
@@ -77,15 +112,50 @@ def transcribe(path):
         else:
             print("STT: (no speech recognized)")
 
+        return text
+
     except Exception as exc:
         print(f"STT ERROR: {exc}")
+        return ""
+
+
+def ask_koyoda(text):
+    if not text:
+        return
+
+    try:
+        prompt = (
+            KOYODA_INSTRUCTIONS
+            + "\n\n"
+            + "USER SAID:\n"
+            + text
+            + "\n\n"
+            + "KOYODA REPLY:"
+        )
+
+        interaction = gemini_client.interactions.create(
+            model=GEMINI_MODEL,
+            input=prompt,
+        )
+
+        reply = (interaction.output_text or "").strip()
+
+        if reply:
+            print(f"KOYODA: {reply}")
+        else:
+            print("KOYODA: (empty response)")
+
+    except Exception as exc:
+        print(f"GEMINI ERROR: {exc}")
 
 
 def finish_utterance(utterance, reason):
     if not utterance:
         return
 
-    seconds = len(utterance) / (SAMPLE_RATE * SAMPLE_WIDTH)
+    seconds = len(utterance) / (
+        SAMPLE_RATE * SAMPLE_WIDTH
+    )
 
     if seconds < MIN_UTTERANCE_SEC:
         print(
@@ -94,7 +164,10 @@ def finish_utterance(utterance, reason):
         )
         return
 
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+    ts = datetime.now().strftime(
+        "%Y%m%d-%H%M%S-%f"
+    )[:-3]
+
     out = Path(f"koyoda-{ts}.wav")
 
     with wave.open(str(out), "wb") as wf:
@@ -109,21 +182,35 @@ def finish_utterance(utterance, reason):
     )
     print(f"Saved: {out.resolve()}")
 
-    transcribe(out)
+    text = transcribe(out)
+
+    if text:
+        ask_koyoda(text)
+
     print()
 
 
-print(f"KOYODA STT receiver listening on {HOST}:{PORT}")
+print(f"KOYODA backend listening on {HOST}:{PORT}")
 print("ESP32 firmware is unchanged.")
+print("Pipeline: PCM -> WAV -> STT -> Gemini -> KOYODA text")
 print()
 
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+with socket.socket(
+    socket.AF_INET,
+    socket.SOCK_STREAM,
+) as srv:
+    srv.setsockopt(
+        socket.SOL_SOCKET,
+        socket.SO_REUSEADDR,
+        1,
+    )
+
     srv.bind((HOST, PORT))
     srv.listen(1)
 
     while True:
         print("Waiting for KOYODA...")
+
         conn, addr = srv.accept()
         print("Connected:", addr)
 
@@ -135,7 +222,10 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
             with conn:
                 while True:
                     readable, _, _ = select.select(
-                        [conn], [], [], 0.25
+                        [conn],
+                        [],
+                        [],
+                        0.25,
                     )
 
                     if not readable:
@@ -152,30 +242,42 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
                                 utterance,
                                 "timeout fallback",
                             )
+
                             utterance.clear()
                             started = False
                             last_packet_time = None
+
                         continue
 
-                    header = recv_exact(conn, 8)
+                    header = recv_exact(
+                        conn,
+                        8,
+                    )
 
                     if header[:4] != b"KOYA":
-                        raise ValueError("bad packet magic")
+                        raise ValueError(
+                            "bad packet magic"
+                        )
 
                     packet_type = header[4]
+
                     payload_len = int.from_bytes(
                         header[5:8],
                         "big",
                     )
+
                     payload = (
-                        recv_exact(conn, payload_len)
+                        recv_exact(
+                            conn,
+                            payload_len,
+                        )
                         if payload_len
                         else b""
                     )
 
                     last_packet_time = time.monotonic()
 
-                    if packet_type == 1:  # START
+                    if packet_type == 1:
                         if started:
                             finish_utterance(
                                 utterance,
@@ -186,19 +288,24 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
                         started = True
                         print("VOICE START")
 
-                    elif packet_type == 2 and started:  # PCM
+                    elif packet_type == 2 and started:
                         utterance.extend(payload)
 
-                    elif packet_type == 3 and started:  # END
+                    elif packet_type == 3 and started:
                         finish_utterance(
                             utterance,
                             "END marker",
                         )
+
                         utterance.clear()
                         started = False
                         last_packet_time = None
 
-        except (ConnectionError, OSError, ValueError) as exc:
+        except (
+            ConnectionError,
+            OSError,
+            ValueError,
+        ) as exc:
             if started and utterance:
                 finish_utterance(
                     utterance,
