@@ -538,7 +538,7 @@ static const char *setup_state_message(void)
     switch (koyoda_wifi_get_setup_state())
     {
         case KOYODA_WIFI_SETUP_STARTING: return "Starting setup hotspot...";
-        case KOYODA_WIFI_SETUP_READY: return "Choose a 2.4 GHz network below.";
+        case KOYODA_WIFI_SETUP_READY: return "Setup hotspot is ready. Type your 2.4 GHz Wi-Fi below.";
         case KOYODA_WIFI_SETUP_TESTING: return "Testing the new Wi-Fi. Please wait...";
         case KOYODA_WIFI_SETUP_FAILED: return "Connection failed. Your old Wi-Fi was kept; check the password and try again.";
         case KOYODA_WIFI_SETUP_SUCCESS: return "Connected and saved. KOYODA is closing setup mode.";
@@ -566,31 +566,16 @@ static esp_err_t portal_root_get(httpd_req_t *req)
 
     httpd_resp_send_chunk(req, head, HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(req, setup_state_message(), HTTPD_RESP_USE_STRLEN);
-    httpd_resp_send_chunk(req, "</div><form method='post' action='/save'><label>Wi-Fi network</label><select name='ssid'>", HTTPD_RESP_USE_STRLEN);
-
-    for (uint16_t i = 0; i < s_scan_count; ++i)
-    {
-        char ssid[33] = {0};
-        size_t n = strnlen((const char *)s_scan_records[i].ssid, sizeof(s_scan_records[i].ssid));
-        if (n > 32) n = 32;
-        memcpy(ssid, s_scan_records[i].ssid, n);
-
-        char escaped[192];
-        html_escape(ssid, escaped, sizeof(escaped));
-
-        char option[300];
-        snprintf(option, sizeof(option),
-                 "<option value=\"%s\">%s (%d dBm)</option>",
-                 escaped, escaped, (int)s_scan_records[i].rssi);
-        httpd_resp_send_chunk(req, option, HTTPD_RESP_USE_STRLEN);
-    }
+    httpd_resp_send_chunk(req,
+        "</div><form method='post' action='/save'>"
+        "<label>Wi-Fi name (SSID)</label>"
+        "<input name='ssid_manual' maxlength='32' autocomplete='off' placeholder='Type the 2.4 GHz Wi-Fi name'>",
+        HTTPD_RESP_USE_STRLEN);
 
     static const char *tail =
-        "</select><label>Other / hidden network <span class='rssi'>(optional)</span></label>"
-        "<input name='ssid_manual' maxlength='32' autocomplete='off' placeholder='Type SSID only if it is not listed'>"
         "<label>Password</label><input name='password' type='password' maxlength='64' autocomplete='new-password' placeholder='Leave blank for an open network'>"
         "<button type='submit'>CONNECT KOYODA</button></form>"
-        "<p class='small'>KOYODA supports 2.4 GHz Wi-Fi. A new network is saved only after KOYODA successfully obtains an IP address, so a wrong password will not erase the last working network.</p>"
+        "<p class='small'>AP-FIRST stability mode: nearby-network scanning is intentionally disabled. Type the SSID exactly as shown on your phone/router. KOYODA supports 2.4 GHz Wi-Fi. A new network is saved only after KOYODA successfully obtains an IP address.</p>"
         "</div></div></body></html>";
 
     httpd_resp_send_chunk(req, tail, HTTPD_RESP_USE_STRLEN);
@@ -601,6 +586,11 @@ static esp_err_t portal_root_get(httpd_req_t *req)
 static void apply_new_credentials_task(void *arg)
 {
     (void)arg;
+
+    /* Let the HTTP POST handler finish sending its acknowledgement before
+     * the STA changes channel/network. In APSTA mode a channel change can
+     * briefly interrupt the phone's connection to KOYODA-Setup. */
+    vTaskDelay(pdMS_TO_TICKS(600));
 
     char ssid[33];
     char password[65];
@@ -824,13 +814,23 @@ static esp_err_t enable_setup_ap(void)
     strlcpy((char *)ap_cfg.ap.password,
             KOYODA_WIFI_SETUP_AP_PASSWORD,
             sizeof(ap_cfg.ap.password));
+    ap_cfg.ap.channel = 1;
     ap_cfg.ap.max_connection = 2;
     ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    ap_cfg.ap.ssid_hidden = 0;
+    ap_cfg.ap.beacon_interval = 100;
+    ap_cfg.ap.pmf_cfg.required = false;
 
     esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_APSTA);
     if (ret == ESP_OK)
     {
         ret = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    }
+
+    if (ret == ESP_OK)
+    {
+        ESP_LOGI(TAG, "SoftAP configured: ssid=%s hidden=0 channel=%u",
+                 KOYODA_WIFI_SETUP_AP_SSID, (unsigned)ap_cfg.ap.channel);
     }
     return ret;
 }
@@ -842,12 +842,11 @@ static void provisioning_task(void *arg)
     set_setup_state(KOYODA_WIFI_SETUP_STARTING);
     s_provision_stop_requested = false;
 
-    /* SAFE v1: scan before SoftAP is enabled. This avoids channel-hopping
-     * while the phone is already attached to KOYODA-Setup. */
-    ESP_LOGI(TAG, "SAFE portal stage 1/3: scanning nearby Wi-Fi");
-    scan_networks();
-
-    ESP_LOGI(TAG, "SAFE portal stage 2/3: enabling KOYODA-Setup");
+    /* SAFE v2: AP-FIRST. Never perform a Wi-Fi scan on the setup-start path.
+     * On this board the Wi-Fi driver and LVGL/display share CPU0, and a
+     * blocking scan can starve the UI before the phone hotspot exists. */
+    s_scan_count = 0;
+    ESP_LOGI(TAG, "SAFE v2 stage 1/2: enabling KOYODA-Setup immediately");
     esp_err_t ret = enable_setup_ap();
     if (ret != ESP_OK)
     {
@@ -859,7 +858,17 @@ static void provisioning_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "SAFE portal stage 3/3: starting HTTP portal");
+    /* Give the Wi-Fi driver one scheduler slice to start AP beacons before
+     * starting the HTTP server. This is asynchronous and does not touch LVGL. */
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    esp_netif_ip_info_t ap_ip = {0};
+    if (s_ap_netif != NULL && esp_netif_get_ip_info(s_ap_netif, &ap_ip) == ESP_OK)
+    {
+        ESP_LOGI(TAG, "KOYODA-Setup AP IP=" IPSTR, IP2STR(&ap_ip.ip));
+    }
+
+    ESP_LOGI(TAG, "SAFE v2 stage 2/2: starting HTTP portal");
     ret = start_http_server();
 
     if (ret != ESP_OK)
@@ -875,7 +884,7 @@ static void provisioning_task(void *arg)
     }
 
     set_setup_state(KOYODA_WIFI_SETUP_READY);
-    ESP_LOGI(TAG, "SAFE phone setup ready: SSID=%s password=%s manual URL=http://192.168.4.1",
+    ESP_LOGI(TAG, "SAFE v2 AP-FIRST ready: SSID=%s password=%s manual URL=http://192.168.4.1",
              KOYODA_WIFI_SETUP_AP_SSID,
              KOYODA_WIFI_SETUP_AP_PASSWORD);
 
