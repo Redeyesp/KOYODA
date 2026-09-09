@@ -5,11 +5,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -36,9 +31,7 @@ static const char *TAG = "KOYODA_WIFI";
 #define WIFI_SETUP_TIMEOUT_MS           (5U * 60U * 1000U)
 #define WIFI_SETUP_SUCCESS_HOLD_MS      3000U
 #define WIFI_TEST_TIMEOUT_MS            15000U
-#define WIFI_SCAN_MAX_AP                16
-#define WIFI_DNS_PORT                   53
-#define WIFI_DNS_BUFFER_SIZE            512
+#define WIFI_SCAN_MAX_AP                12
 
 #define WIFI_TEST_GOT_IP_BIT            BIT0
 #define WIFI_TEST_DISCONNECTED_BIT      BIT1
@@ -63,7 +56,6 @@ static char s_active_ssid[33] = {0};
 static char s_active_password[65] = {0};
 static char s_pending_ssid[33] = {0};
 static char s_pending_password[65] = {0};
-static bool s_persist_active_on_success = false;
 
 static esp_netif_t *s_sta_netif = NULL;
 static esp_netif_t *s_ap_netif = NULL;
@@ -72,8 +64,6 @@ static esp_event_handler_instance_t s_ip_handler = NULL;
 static EventGroupHandle_t s_test_events = NULL;
 
 static httpd_handle_t s_http_server = NULL;
-static TaskHandle_t s_dns_task = NULL;
-static int s_dns_socket = -1;
 static TaskHandle_t s_provision_task = NULL;
 static TaskHandle_t s_apply_task = NULL;
 
@@ -356,26 +346,6 @@ static void wifi_event_handler(void *arg,
             return;
         }
 
-        if (s_persist_active_on_success)
-        {
-            char active_ssid[33];
-            char active_password[65];
-            if (copy_active_credentials(active_ssid, sizeof(active_ssid),
-                                        active_password, sizeof(active_password)))
-            {
-                esp_err_t ret = save_credentials(active_ssid, active_password);
-                if (ret == ESP_OK)
-                {
-                    ESP_LOGI(TAG, "Initial Wi-Fi copied into NVS");
-                    s_persist_active_on_success = false;
-                }
-                else
-                {
-                    ESP_LOGW(TAG, "Could not persist initial Wi-Fi: %s",
-                             esp_err_to_name(ret));
-                }
-            }
-        }
     }
 }
 
@@ -620,21 +590,11 @@ static esp_err_t portal_root_get(httpd_req_t *req)
         "<input name='ssid_manual' maxlength='32' autocomplete='off' placeholder='Type SSID only if it is not listed'>"
         "<label>Password</label><input name='password' type='password' maxlength='64' autocomplete='new-password' placeholder='Leave blank for an open network'>"
         "<button type='submit'>CONNECT KOYODA</button></form>"
-        "<div class='links'><a href='/rescan'>Rescan networks</a></div>"
         "<p class='small'>KOYODA supports 2.4 GHz Wi-Fi. A new network is saved only after KOYODA successfully obtains an IP address, so a wrong password will not erase the last working network.</p>"
         "</div></div></body></html>";
 
     httpd_resp_send_chunk(req, tail, HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(req, NULL, 0);
-    return ESP_OK;
-}
-
-static esp_err_t portal_rescan_get(httpd_req_t *req)
-{
-    scan_networks();
-    httpd_resp_set_status(req, "303 See Other");
-    httpd_resp_set_hdr(req, "Location", "/");
-    httpd_resp_send(req, "Rescanned", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -771,9 +731,9 @@ static esp_err_t portal_save_post(httpd_req_t *req)
     BaseType_t created = xTaskCreate(
         apply_new_credentials_task,
         "wifi_apply",
-        5120,
+        4096,
         NULL,
-        3,
+        1,
         &s_apply_task);
 
     if (created != pdPASS)
@@ -812,7 +772,7 @@ static esp_err_t start_http_server(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_open_sockets = 6;
+    config.max_open_sockets = 4;
     config.lru_purge_enable = true;
 
     esp_err_t ret = httpd_start(&s_http_server, &config);
@@ -834,16 +794,8 @@ static esp_err_t start_http_server(void)
         .handler = portal_save_post,
         .user_ctx = NULL,
     };
-    const httpd_uri_t rescan = {
-        .uri = "/rescan",
-        .method = HTTP_GET,
-        .handler = portal_rescan_get,
-        .user_ctx = NULL,
-    };
-
     httpd_register_uri_handler(s_http_server, &root);
     httpd_register_uri_handler(s_http_server, &save);
-    httpd_register_uri_handler(s_http_server, &rescan);
     httpd_register_err_handler(s_http_server, HTTPD_404_NOT_FOUND, portal_404);
 
     return ESP_OK;
@@ -855,159 +807,6 @@ static void stop_http_server(void)
     {
         httpd_stop(s_http_server);
         s_http_server = NULL;
-    }
-}
-
-/* ------------------------------------------------------------------------- */
-/* Minimal captive DNS: answer A queries with the SoftAP address.            */
-/* ------------------------------------------------------------------------- */
-
-static void dns_server_task(void *arg)
-{
-    (void)arg;
-
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0)
-    {
-        ESP_LOGE(TAG, "DNS socket failed errno=%d", errno);
-        s_dns_task = NULL;
-        vTaskDelete(NULL);
-        return;
-    }
-
-    s_dns_socket = sock;
-
-    struct sockaddr_in server = {0};
-    server.sin_family = AF_INET;
-    server.sin_port = htons(WIFI_DNS_PORT);
-    server.sin_addr.s_addr = htonl(INADDR_ANY);
-
-    if (bind(sock, (struct sockaddr *)&server, sizeof(server)) != 0)
-    {
-        ESP_LOGE(TAG, "DNS bind failed errno=%d", errno);
-        close(sock);
-        s_dns_socket = -1;
-        s_dns_task = NULL;
-        vTaskDelete(NULL);
-        return;
-    }
-
-    uint8_t packet[WIFI_DNS_BUFFER_SIZE];
-
-    while (s_provisioning)
-    {
-        struct sockaddr_in client = {0};
-        socklen_t client_len = sizeof(client);
-        int len = recvfrom(sock, packet, sizeof(packet), 0,
-                           (struct sockaddr *)&client, &client_len);
-
-        if (len < 12)
-        {
-            if (!s_provisioning) break;
-            continue;
-        }
-
-        uint16_t qdcount = (uint16_t)((packet[4] << 8) | packet[5]);
-        if (qdcount == 0)
-        {
-            continue;
-        }
-
-        size_t q = 12;
-        while (q < (size_t)len && packet[q] != 0)
-        {
-            uint8_t label_len = packet[q];
-            if ((label_len & 0xC0) != 0 || q + 1U + label_len >= (size_t)len)
-            {
-                q = (size_t)len;
-                break;
-            }
-            q += 1U + label_len;
-        }
-
-        if (q + 5U > (size_t)len)
-        {
-            continue;
-        }
-
-        size_t question_end = q + 5U; /* zero + qtype + qclass */
-        uint16_t qtype = (uint16_t)((packet[q + 1] << 8) | packet[q + 2]);
-
-        packet[2] = 0x81;
-        packet[3] = 0x80;
-        packet[6] = 0;
-        packet[7] = (qtype == 1 || qtype == 255) ? 1 : 0;
-        packet[8] = packet[9] = packet[10] = packet[11] = 0;
-
-        size_t response_len = question_end;
-
-        if (packet[7] == 1 && response_len + 16U <= sizeof(packet))
-        {
-            esp_netif_ip_info_t ip_info = {0};
-            if (s_ap_netif == NULL ||
-                esp_netif_get_ip_info(s_ap_netif, &ip_info) != ESP_OK)
-            {
-                continue;
-            }
-
-            uint32_t host_ip = ntohl(ip_info.ip.addr);
-
-            packet[response_len++] = 0xC0;
-            packet[response_len++] = 0x0C;
-            packet[response_len++] = 0x00;
-            packet[response_len++] = 0x01;
-            packet[response_len++] = 0x00;
-            packet[response_len++] = 0x01;
-            packet[response_len++] = 0x00;
-            packet[response_len++] = 0x00;
-            packet[response_len++] = 0x00;
-            packet[response_len++] = 0x3C;
-            packet[response_len++] = 0x00;
-            packet[response_len++] = 0x04;
-            packet[response_len++] = (uint8_t)((host_ip >> 24) & 0xFF);
-            packet[response_len++] = (uint8_t)((host_ip >> 16) & 0xFF);
-            packet[response_len++] = (uint8_t)((host_ip >> 8) & 0xFF);
-            packet[response_len++] = (uint8_t)(host_ip & 0xFF);
-        }
-
-        sendto(sock, packet, response_len, 0,
-               (struct sockaddr *)&client, client_len);
-    }
-
-    close(sock);
-    s_dns_socket = -1;
-    s_dns_task = NULL;
-    vTaskDelete(NULL);
-}
-
-static esp_err_t start_dns_server(void)
-{
-    if (s_dns_task != NULL)
-    {
-        return ESP_OK;
-    }
-
-    BaseType_t created = xTaskCreate(
-        dns_server_task,
-        "wifi_dns",
-        3072,
-        NULL,
-        3,
-        &s_dns_task);
-
-    return (created == pdPASS) ? ESP_OK : ESP_ERR_NO_MEM;
-}
-
-static void stop_dns_server(void)
-{
-    if (s_dns_socket >= 0)
-    {
-        shutdown(s_dns_socket, SHUT_RDWR);
-    }
-
-    for (int i = 0; i < 20 && s_dns_task != NULL; ++i)
-    {
-        vTaskDelay(pdMS_TO_TICKS(25));
     }
 }
 
@@ -1043,6 +842,12 @@ static void provisioning_task(void *arg)
     set_setup_state(KOYODA_WIFI_SETUP_STARTING);
     s_provision_stop_requested = false;
 
+    /* SAFE v1: scan before SoftAP is enabled. This avoids channel-hopping
+     * while the phone is already attached to KOYODA-Setup. */
+    ESP_LOGI(TAG, "SAFE portal stage 1/3: scanning nearby Wi-Fi");
+    scan_networks();
+
+    ESP_LOGI(TAG, "SAFE portal stage 2/3: enabling KOYODA-Setup");
     esp_err_t ret = enable_setup_ap();
     if (ret != ESP_OK)
     {
@@ -1054,20 +859,13 @@ static void provisioning_task(void *arg)
         return;
     }
 
-    /* Scan before opening the portal so the first phone page already has choices. */
-    scan_networks();
-
+    ESP_LOGI(TAG, "SAFE portal stage 3/3: starting HTTP portal");
     ret = start_http_server();
-    if (ret == ESP_OK)
-    {
-        ret = start_dns_server();
-    }
 
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Provisioning service start failed: %s", esp_err_to_name(ret));
         stop_http_server();
-        stop_dns_server();
         esp_wifi_set_mode(WIFI_MODE_STA);
         s_provisioning = false;
         set_setup_state(KOYODA_WIFI_SETUP_OFF);
@@ -1077,7 +875,7 @@ static void provisioning_task(void *arg)
     }
 
     set_setup_state(KOYODA_WIFI_SETUP_READY);
-    ESP_LOGI(TAG, "Phone setup ready: SSID=%s password=%s URL=http://192.168.4.1",
+    ESP_LOGI(TAG, "SAFE phone setup ready: SSID=%s password=%s manual URL=http://192.168.4.1",
              KOYODA_WIFI_SETUP_AP_SSID,
              KOYODA_WIFI_SETUP_AP_PASSWORD);
 
@@ -1100,7 +898,6 @@ static void provisioning_task(void *arg)
     }
 
     stop_http_server();
-    stop_dns_server();
     esp_wifi_set_mode(WIFI_MODE_STA);
 
     s_provisioning = false;
@@ -1142,9 +939,9 @@ esp_err_t koyoda_wifi_begin_provisioning(void)
     BaseType_t result = xTaskCreate(
         provisioning_task,
         "wifi_setup",
-        6144,
+        4096,
         NULL,
-        2,
+        1,
         &s_provision_task);
 
     if (result != pdPASS)
@@ -1271,8 +1068,7 @@ static void wifi_start_task(void *arg)
         strlcpy(ssid, KOYODA_WIFI_SSID, sizeof(ssid));
         strlcpy(password, KOYODA_WIFI_PASSWORD, sizeof(password));
         have_credentials = true;
-        s_persist_active_on_success = true;
-        ESP_LOGI(TAG, "Using build Wi-Fi once; it will be copied to NVS after success");
+        ESP_LOGI(TAG, "Using build Wi-Fi fallback");
     }
 
     remember_active_credentials(ssid, password);
@@ -1300,8 +1096,7 @@ static void wifi_start_task(void *arg)
 
     if (!have_credentials)
     {
-        ESP_LOGW(TAG, "No saved Wi-Fi; starting phone setup automatically");
-        koyoda_wifi_begin_provisioning();
+        ESP_LOGW(TAG, "No saved Wi-Fi; SAFE v1 stays offline until CHANGE WI-FI is pressed");
     }
 
     vTaskDelete(NULL);
@@ -1319,7 +1114,7 @@ esp_err_t koyoda_wifi_start(void)
     BaseType_t result = xTaskCreate(
         wifi_start_task,
         "wifi_start",
-        6144,
+        4096,
         NULL,
         1,
         NULL);
