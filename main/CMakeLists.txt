@@ -17,6 +17,13 @@ idf_component_register(
          "koyoda_wifi.c"
          "koyoda_audio_duplex.c"
          "koyoda_audio_stream.c"
+         "koyoda_face_state.c"
+         "koyoda_think_01.c"
+         "koyoda_think_02.c"
+         "koyoda_think_03.c"
+         "koyoda_speak_closed.c"
+         "koyoda_speak_soft.c"
+         "koyoda_speak_open.c"
     INCLUDE_DIRS "."
     REQUIRES
          XPowersLib

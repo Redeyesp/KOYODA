@@ -17,6 +17,7 @@
 #include "lwip/inet.h"
 
 #include "koyoda_audio_duplex.h"
+#include "koyoda_face_state.h"
 
 static const char *TAG = "KOYODA_STREAM";
 
@@ -41,6 +42,8 @@ static const char *TAG = "KOYODA_STREAM";
 #define STREAM_TYPE_PLAY_START 4
 #define STREAM_TYPE_PLAY_PCM   5
 #define STREAM_TYPE_PLAY_END   6
+#define STREAM_TYPE_THINK_START 7
+#define STREAM_TYPE_THINK_END   8
 
 typedef struct
 {
@@ -180,6 +183,36 @@ static bool receive_playback_packet(
         ((uint32_t)header[6] << 8) |
         (uint32_t)header[7];
 
+    if (type == STREAM_TYPE_THINK_START)
+    {
+        if (payload_len != 0)
+        {
+            ESP_LOGE(TAG, "THINK_START payload must be empty");
+            return false;
+        }
+
+        koyoda_face_state_set(KOYODA_FACE_AI_THINKING);
+        ESP_LOGI(TAG, "AI THINK RX START");
+        return true;
+    }
+
+    if (type == STREAM_TYPE_THINK_END)
+    {
+        if (payload_len != 0)
+        {
+            ESP_LOGE(TAG, "THINK_END payload must be empty");
+            return false;
+        }
+
+        /* Do not let a late THINK_END override active speaker animation. */
+        if (koyoda_face_state_get() == KOYODA_FACE_AI_THINKING)
+        {
+            koyoda_face_state_set(KOYODA_FACE_AI_IDLE);
+        }
+        ESP_LOGI(TAG, "AI THINK RX END");
+        return true;
+    }
+
     if (type == STREAM_TYPE_PLAY_START)
     {
         if (payload_len != 0)
@@ -196,6 +229,7 @@ static bool receive_playback_packet(
         }
 
         *playback_open = true;
+        koyoda_face_state_set(KOYODA_FACE_AI_SPEAKING);
         ESP_LOGI(TAG, "AI REPLY RX START");
         return true;
     }
@@ -246,6 +280,7 @@ static bool receive_playback_packet(
         }
 
         *playback_open = false;
+        koyoda_face_state_set(KOYODA_FACE_AI_IDLE);
         ESP_LOGI(TAG, "AI REPLY RX END");
         return true;
     }
@@ -306,6 +341,9 @@ static void close_stream_socket(
     int *sock,
     bool *playback_open)
 {
+    /* Any broken backend transaction must release the AI face state. */
+    koyoda_face_state_set(KOYODA_FACE_AI_IDLE);
+
     if (*playback_open)
     {
         /* Unblock the audio owner if the network died mid-reply. */
@@ -326,7 +364,7 @@ static void stream_task(void *arg)
 
     ESP_LOGI(
         TAG,
-        "STREAM AI-06 duplex ready -> %s:%d",
+        "STREAM AI-07 face+duplex ready -> %s:%d",
         CONFIG_KOYODA_STREAM_HOST,
         CONFIG_KOYODA_STREAM_PORT);
 

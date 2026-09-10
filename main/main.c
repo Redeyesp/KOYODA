@@ -18,6 +18,9 @@
 #include "koyoda_wifi.h"
 #include "koyoda_audio_duplex.h"
 #include "koyoda_audio_stream.h"
+#include "koyoda_face_state.h"
+#include "koyoda_speaking_assets.h"
+#include "koyoda_thinking_assets.h"
 
 LV_IMAGE_DECLARE(koyoda_idle);
 LV_IMAGE_DECLARE(koyoda_half);
@@ -73,6 +76,12 @@ static uint32_t wifi_last_refresh_ms = 0;
 static bool charging_animation_pending;
 static koyoda_animation_t animation;
 static bool touch_held;
+
+
+/* AI-07 face animation runtime. LVGL is still owned only by this UI loop. */
+static koyoda_face_ai_state_t ai_face_prev_state = KOYODA_FACE_AI_IDLE;
+static unsigned ai_face_step = 0;
+static uint32_t ai_face_frame_started_ms = 0;
 static void request_charging_animation(void)
 {
     bsp_display_lock(-1);
@@ -1337,30 +1346,97 @@ static void face_animation_step(void)
         }
     }
 
-    const lv_image_dsc_t *frames[] = {
+    const lv_image_dsc_t *normal_frames[] = {
         &koyoda_idle, &koyoda_half, &koyoda_closed,
         &koyoda_sleep_1, &koyoda_sleep_2, &koyoda_sleep_3,
         &koyoda_charge_1, &koyoda_charge_2, &koyoda_charge_3,
         &koyoda_charge_4, &koyoda_charge_5, &koyoda_charge_6,
         &fun_happy
     };
+
+    /* Astra-approved AI-07 assets. */
+    const lv_image_dsc_t *thinking_frames[] = {
+        &koyoda_think_01,
+        &koyoda_think_02,
+        &koyoda_think_03,
+        &koyoda_think_02,
+    };
+    const uint16_t thinking_ms[] = {300, 300, 380, 300};
+
+    const lv_image_dsc_t *speaking_frames[] = {
+        &koyoda_speak_closed,
+        &koyoda_speak_soft,
+        &koyoda_speak_open,
+        &koyoda_speak_soft,
+    };
+    const uint16_t speaking_ms[] = {90, 100, 125, 95};
+
     bsp_display_lock(-1);
 
     uint32_t now_ms = lv_tick_get();
+    koyoda_face_ai_state_t ai_state = koyoda_face_state_get();
 
-    unsigned frame = anim_tick(
-        &animation,
-        now_ms,
-        current_page == PAGE_FACE,
-        power_dialog_open,
-        touch_held,
-        &charging_animation_pending);
+    if (ai_state != ai_face_prev_state)
+    {
+        ai_face_prev_state = ai_state;
+        ai_face_step = 0;
+        ai_face_frame_started_ms = now_ms;
+
+        /* AI interaction counts as activity, so KOYODA does not fall asleep
+         * immediately after finishing a reply. */
+        anim_reset(&animation, now_ms);
+    }
+
+    const lv_image_dsc_t *desired_face = NULL;
+
+    if (ai_state == KOYODA_FACE_AI_THINKING)
+    {
+        /* Suspend blink/sleep while the backend is processing the utterance. */
+        anim_reset(&animation, now_ms);
+
+        if ((uint32_t)(now_ms - ai_face_frame_started_ms) >=
+            thinking_ms[ai_face_step])
+        {
+            ai_face_step = (ai_face_step + 1U) % 4U;
+            ai_face_frame_started_ms = now_ms;
+        }
+
+        desired_face = thinking_frames[ai_face_step];
+    }
+    else if (ai_state == KOYODA_FACE_AI_SPEAKING)
+    {
+        /* Speaking mouth animation is intentionally independent of PCM
+         * amplitude for this first stable integration. */
+        anim_reset(&animation, now_ms);
+
+        if ((uint32_t)(now_ms - ai_face_frame_started_ms) >=
+            speaking_ms[ai_face_step])
+        {
+            ai_face_step = (ai_face_step + 1U) % 4U;
+            ai_face_frame_started_ms = now_ms;
+        }
+
+        desired_face = speaking_frames[ai_face_step];
+    }
+    else
+    {
+        unsigned frame = anim_tick(
+            &animation,
+            now_ms,
+            current_page == PAGE_FACE,
+            power_dialog_open,
+            touch_held,
+            &charging_animation_pending);
+
+        desired_face = normal_frames[frame];
+    }
 
     if (current_page == PAGE_FACE &&
         !power_dialog_open &&
-        lv_image_get_src(face_img) != frames[frame])
+        desired_face != NULL &&
+        lv_image_get_src(face_img) != desired_face)
     {
-        lv_image_set_src(face_img, frames[frame]);
+        lv_image_set_src(face_img, desired_face);
     }
 
     /*
