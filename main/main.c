@@ -33,7 +33,6 @@ LV_IMAGE_DECLARE(koyoda_charge_6);
 LV_IMAGE_DECLARE(koyoda_sleep_1);
 LV_IMAGE_DECLARE(koyoda_sleep_2);
 LV_IMAGE_DECLARE(koyoda_sleep_3);
-LV_IMAGE_DECLARE(fun_happy);
 
 static const char *TAG = "KOYODA";
 
@@ -1353,8 +1352,7 @@ static void face_animation_step(void)
         &koyoda_idle, &koyoda_half, &koyoda_closed,
         &koyoda_sleep_1, &koyoda_sleep_2, &koyoda_sleep_3,
         &koyoda_charge_1, &koyoda_charge_2, &koyoda_charge_3,
-        &koyoda_charge_4, &koyoda_charge_5, &koyoda_charge_6,
-        &fun_happy
+        &koyoda_charge_4, &koyoda_charge_5, &koyoda_charge_6
     };
 
     /*
@@ -1372,12 +1370,12 @@ static void face_animation_step(void)
     const uint16_t thinking_ms[] = {300, 300, 380, 300};
 
     const lv_image_dsc_t *speaking_frames[] = {
-        &koyoda_speak_patch_closed,
         &koyoda_speak_patch_soft,
         &koyoda_speak_patch_open,
         &koyoda_speak_patch_soft,
+        &koyoda_speak_patch_closed,
     };
-    const uint16_t speaking_ms[] = {90, 100, 125, 95};
+    const uint16_t speaking_ms[] = {110, 135, 105, 80};
 
     bsp_display_lock(-1);
 
@@ -1440,6 +1438,16 @@ static void face_animation_step(void)
             &charging_animation_pending);
 
         desired_face = normal_frames[frame];
+
+        /*
+         * Wake expression without a full-screen fun_happy asset:
+         * during the last ANIM_WAKE step, keep the normal idle face and
+         * reuse the already-compiled speak-open mouth overlay.
+         */
+        if (animation.mode == ANIM_WAKE && animation.step == 3U)
+        {
+            desired_speaking_patch = &koyoda_speak_patch_open;
+        }
     }
 
     const bool face_visible =

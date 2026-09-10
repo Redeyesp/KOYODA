@@ -27,7 +27,6 @@ typedef struct
  * 2  = closed
  * 3..5  = sleep 1..3
  * 6..11 = charging 1..6
- * 12 = fun_happy
  */
 static const unsigned anim_idle_frames[]   = {0, 1, 2, 1};
 static const uint16_t anim_idle_ms[]       = {3000, 60, 90, 60};
@@ -43,12 +42,12 @@ static const uint16_t anim_charge_ms[]     = {120, 100, 100, 120, 100, 450, 100,
 
 /*
  * Tap-to-wake sequence requested:
- * Closed -> Half Closed -> Idle -> Happy -> Idle
+ * Closed -> Half Closed -> Idle -> Idle + open-mouth overlay -> Idle
  *
- * Intentionally slower than a normal blink so it feels like KOYODA
- * is waking up rather than snapping awake.
+ * The final wake expression reuses KOYODA's existing speak-open mouth patch.
+ * This removes the separate full-screen fun_happy image from firmware.
  */
-static const unsigned anim_wake_frames[]   = {2, 1, 0, 12};
+static const unsigned anim_wake_frames[]   = {2, 1, 0, 0};
 static const uint16_t anim_wake_ms[]       = {450, 500, 650, 1100};
 
 static inline void anim_reset(koyoda_animation_t *a, uint32_t now)

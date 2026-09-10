@@ -229,7 +229,11 @@ static bool receive_playback_packet(
         }
 
         *playback_open = true;
-        koyoda_face_state_set(KOYODA_FACE_AI_SPEAKING);
+        /*
+         * The audio-owner task now owns SPEAKING timing.
+         * PLAY_START only queues playback; the face changes when the
+         * ES8311 actually begins consuming the reply.
+         */
         ESP_LOGI(TAG, "AI REPLY RX START");
         return true;
     }
@@ -280,7 +284,11 @@ static bool receive_playback_packet(
         }
 
         *playback_open = false;
-        koyoda_face_state_set(KOYODA_FACE_AI_IDLE);
+        /*
+         * Do not end the speaking face here. PLAY_END only enters the
+         * audio queue; the audio-owner returns the face to IDLE after
+         * the real speaker playback has finished.
+         */
         ESP_LOGI(TAG, "AI REPLY RX END");
         return true;
     }

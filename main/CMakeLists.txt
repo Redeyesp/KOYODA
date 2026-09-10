@@ -13,7 +13,6 @@ idf_component_register(
          "koyoda_sleep_1.c"
          "koyoda_sleep_2.c"
          "koyoda_sleep_3.c"
-         "fun_happy.c"
          "koyoda_wifi.c"
          "koyoda_audio_duplex.c"
          "koyoda_audio_stream.c"

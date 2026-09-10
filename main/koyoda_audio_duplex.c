@@ -15,6 +15,8 @@
 
 #include "bsp/esp-bsp.h"
 
+#include "koyoda_face_state.h"
+
 /*
  * KOYODA Shared Audio Step 1
  *
@@ -530,6 +532,12 @@ static void service_remote_playback_if_pending(void)
         return;
     }
 
+    /*
+     * Tie the speaking face to REAL speaker playback, not to network
+     * packet arrival. This keeps mouth animation alive for the complete
+     * audible reply and removes the intermittent no-mouth-movement case.
+     */
+    koyoda_face_state_set(KOYODA_FACE_AI_SPEAKING);
     ESP_LOGI(TAG, "REMOTE SPEAK START: mic/VAD paused");
 
     s_mic_running = false;
@@ -586,6 +594,7 @@ static void service_remote_playback_if_pending(void)
 
     vad_reset_after_beep();
     s_mic_running = true;
+    koyoda_face_state_set(KOYODA_FACE_AI_IDLE);
 
     uint32_t duration_ms =
         (uint32_t)((xTaskGetTickCount() - started) * portTICK_PERIOD_MS);
