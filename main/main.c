@@ -19,8 +19,7 @@
 #include "koyoda_audio_duplex.h"
 #include "koyoda_audio_stream.h"
 #include "koyoda_face_state.h"
-#include "koyoda_speaking_assets.h"
-#include "koyoda_thinking_assets.h"
+#include "koyoda_ai_overlays.h"
 
 LV_IMAGE_DECLARE(koyoda_idle);
 LV_IMAGE_DECLARE(koyoda_half);
@@ -39,6 +38,8 @@ LV_IMAGE_DECLARE(fun_happy);
 static const char *TAG = "KOYODA";
 
 static lv_obj_t *face_img = NULL;
+static lv_obj_t *thinking_overlay_img = NULL;
+static lv_obj_t *speaking_overlay_img = NULL;
 static lv_obj_t *power_overlay = NULL;
 static lv_obj_t *battery_page = NULL;
 static lv_obj_t *battery_fill = NULL;
@@ -956,6 +957,8 @@ static void set_page_from_lvgl(koyoda_page_t page)
      * This prevents the Face/Battery/Wi-Fi overlay bug by construction.
      */
     lv_obj_add_flag(face_img, LV_OBJ_FLAG_HIDDEN);
+    if (thinking_overlay_img) lv_obj_add_flag(thinking_overlay_img, LV_OBJ_FLAG_HIDDEN);
+    if (speaking_overlay_img) lv_obj_add_flag(speaking_overlay_img, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(wifi_page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(volume_page, LV_OBJ_FLAG_HIDDEN);
@@ -1354,20 +1357,25 @@ static void face_animation_step(void)
         &fun_happy
     };
 
-    /* Astra-approved AI-07 assets. */
+    /*
+     * AI-07 LITE:
+     * The Astra-approved frames differ from idle only in tiny areas.
+     * We animate only those cropped patches instead of compiling six
+     * additional 466x466 RGB565 full-screen frames.
+     */
     const lv_image_dsc_t *thinking_frames[] = {
-        &koyoda_think_01,
-        &koyoda_think_02,
-        &koyoda_think_03,
-        &koyoda_think_02,
+        &koyoda_think_patch_01,
+        &koyoda_think_patch_02,
+        &koyoda_think_patch_03,
+        &koyoda_think_patch_02,
     };
     const uint16_t thinking_ms[] = {300, 300, 380, 300};
 
     const lv_image_dsc_t *speaking_frames[] = {
-        &koyoda_speak_closed,
-        &koyoda_speak_soft,
-        &koyoda_speak_open,
-        &koyoda_speak_soft,
+        &koyoda_speak_patch_closed,
+        &koyoda_speak_patch_soft,
+        &koyoda_speak_patch_open,
+        &koyoda_speak_patch_soft,
     };
     const uint16_t speaking_ms[] = {90, 100, 125, 95};
 
@@ -1388,10 +1396,12 @@ static void face_animation_step(void)
     }
 
     const lv_image_dsc_t *desired_face = NULL;
+    const lv_image_dsc_t *desired_thinking_patch = NULL;
+    const lv_image_dsc_t *desired_speaking_patch = NULL;
 
     if (ai_state == KOYODA_FACE_AI_THINKING)
     {
-        /* Suspend blink/sleep while the backend is processing the utterance. */
+        /* Keep the base face at idle and animate only the tiny dot strip. */
         anim_reset(&animation, now_ms);
 
         if ((uint32_t)(now_ms - ai_face_frame_started_ms) >=
@@ -1401,12 +1411,12 @@ static void face_animation_step(void)
             ai_face_frame_started_ms = now_ms;
         }
 
-        desired_face = thinking_frames[ai_face_step];
+        desired_face = &koyoda_idle;
+        desired_thinking_patch = thinking_frames[ai_face_step];
     }
     else if (ai_state == KOYODA_FACE_AI_SPEAKING)
     {
-        /* Speaking mouth animation is intentionally independent of PCM
-         * amplitude for this first stable integration. */
+        /* Keep the base face at idle and animate only the mouth patch. */
         anim_reset(&animation, now_ms);
 
         if ((uint32_t)(now_ms - ai_face_frame_started_ms) >=
@@ -1416,7 +1426,8 @@ static void face_animation_step(void)
             ai_face_frame_started_ms = now_ms;
         }
 
-        desired_face = speaking_frames[ai_face_step];
+        desired_face = &koyoda_idle;
+        desired_speaking_patch = speaking_frames[ai_face_step];
     }
     else
     {
@@ -1431,12 +1442,40 @@ static void face_animation_step(void)
         desired_face = normal_frames[frame];
     }
 
-    if (current_page == PAGE_FACE &&
-        !power_dialog_open &&
+    const bool face_visible =
+        (current_page == PAGE_FACE && !power_dialog_open);
+
+    if (face_visible &&
         desired_face != NULL &&
         lv_image_get_src(face_img) != desired_face)
     {
         lv_image_set_src(face_img, desired_face);
+    }
+
+    if (!face_visible || desired_thinking_patch == NULL)
+    {
+        lv_obj_add_flag(thinking_overlay_img, LV_OBJ_FLAG_HIDDEN);
+    }
+    else
+    {
+        if (lv_image_get_src(thinking_overlay_img) != desired_thinking_patch)
+        {
+            lv_image_set_src(thinking_overlay_img, desired_thinking_patch);
+        }
+        lv_obj_clear_flag(thinking_overlay_img, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (!face_visible || desired_speaking_patch == NULL)
+    {
+        lv_obj_add_flag(speaking_overlay_img, LV_OBJ_FLAG_HIDDEN);
+    }
+    else
+    {
+        if (lv_image_get_src(speaking_overlay_img) != desired_speaking_patch)
+        {
+            lv_image_set_src(speaking_overlay_img, desired_speaking_patch);
+        }
+        lv_obj_clear_flag(speaking_overlay_img, LV_OBJ_FLAG_HIDDEN);
     }
 
     /*
@@ -1531,6 +1570,33 @@ void app_main(void)
     lv_image_set_pivot(face_img, 233, 233);
     lv_image_set_rotation(face_img, 900);
     lv_obj_center(face_img);
+
+    /*
+     * Tiny AI overlays use the same global rotation pivot as the 466x466
+     * face.  Their local pivots may be outside the cropped image bounds;
+     * that is intentional: global pivot = (233,233), exactly like face_img.
+     */
+    thinking_overlay_img = lv_image_create(screen);
+    lv_image_set_src(thinking_overlay_img, &koyoda_think_patch_01);
+    lv_obj_set_pos(thinking_overlay_img,
+                   KOYODA_THINK_PATCH_X,
+                   KOYODA_THINK_PATCH_Y);
+    lv_image_set_pivot(thinking_overlay_img,
+                       233 - KOYODA_THINK_PATCH_X,
+                       233 - KOYODA_THINK_PATCH_Y);
+    lv_image_set_rotation(thinking_overlay_img, 900);
+    lv_obj_add_flag(thinking_overlay_img, LV_OBJ_FLAG_HIDDEN);
+
+    speaking_overlay_img = lv_image_create(screen);
+    lv_image_set_src(speaking_overlay_img, &koyoda_speak_patch_closed);
+    lv_obj_set_pos(speaking_overlay_img,
+                   KOYODA_SPEAK_PATCH_X,
+                   KOYODA_SPEAK_PATCH_Y);
+    lv_image_set_pivot(speaking_overlay_img,
+                       233 - KOYODA_SPEAK_PATCH_X,
+                       233 - KOYODA_SPEAK_PATCH_Y);
+    lv_image_set_rotation(speaking_overlay_img, 900);
+    lv_obj_add_flag(speaking_overlay_img, LV_OBJ_FLAG_HIDDEN);
 
     create_battery_page(screen);
     create_wifi_page(screen);
