@@ -12,6 +12,7 @@ idf_component_register(
          "koyoda_ai_overlays.c"
          "koyoda_charge_composite.c"
          "koyoda_blink_patches.c"
+         "koyoda_listening_notice.c"
     INCLUDE_DIRS "."
     REQUIRES
          XPowersLib
