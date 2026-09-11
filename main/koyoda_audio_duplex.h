@@ -42,6 +42,24 @@ void koyoda_audio_duplex_set_frame_callback(
     koyoda_audio_frame_cb_t callback,
     void *user_ctx);
 
+/*
+ * AI mode gate.
+ *
+ * Default after every boot: OFF.
+ *
+ * OFF means:
+ * - ES7210/I2S stay initialized for stability,
+ * - microphone frames are discarded locally,
+ * - VAD is not evaluated,
+ * - no microphone frame callback/network stream is produced,
+ * - remote AI playback is rejected/aborted.
+ *
+ * This setting is intentionally NOT stored in NVS: KOYODA always boots with
+ * AI OFF and requires an explicit long-press to enable it.
+ */
+void koyoda_audio_duplex_ai_set_enabled(bool enabled);
+bool koyoda_audio_duplex_ai_is_enabled(void);
+
 /* Quiet event beeps. */
 void koyoda_audio_duplex_beep_charge(void);
 void koyoda_audio_duplex_beep_test(void);

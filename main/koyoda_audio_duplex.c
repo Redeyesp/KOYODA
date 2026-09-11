@@ -106,6 +106,8 @@ typedef struct
 #define AUDIO_EVT_CHARGE_BEEP       (1UL << 0)
 #define AUDIO_EVT_TEST_BEEP         (1UL << 1)
 #define AUDIO_EVT_VOLUME_CHANGE     (1UL << 2)
+#define AUDIO_EVT_AI_ON_BEEP        (1UL << 3)
+#define AUDIO_EVT_AI_OFF_BEEP       (1UL << 4)
 
 #define NVS_NAMESPACE "koyoda_audio"
 #define NVS_KEY_VOLUME "volume"
@@ -121,6 +123,9 @@ static esp_codec_dev_handle_t s_speaker = NULL;
 static volatile bool s_ready = false;
 static volatile bool s_mic_running = false;
 static volatile int s_volume_percent = DEFAULT_VOLUME_PERCENT;
+
+/* Explicit user-controlled AI gate. Always OFF after boot. */
+static volatile bool s_ai_enabled = false;
 
 static koyoda_audio_frame_cb_t s_frame_callback = NULL;
 static void *s_frame_callback_ctx = NULL;
@@ -546,6 +551,17 @@ static void service_remote_playback_if_pending(void)
         return;
     }
 
+    if (!s_ai_enabled)
+    {
+        /*
+         * Do not allow a stale cloud/PC reply to speak after the user has
+         * explicitly turned AI OFF.
+         */
+        xQueueReset(s_playback_queue);
+        koyoda_face_state_set(KOYODA_FACE_AI_IDLE);
+        return;
+    }
+
     playback_msg_t msg;
 
     if (xQueueReceive(s_playback_queue, &msg, 0) != pdTRUE)
@@ -577,6 +593,13 @@ static void service_remote_playback_if_pending(void)
 
     while (!finished)
     {
+        if (!s_ai_enabled)
+        {
+            ESP_LOGI(TAG, "REMOTE SPEAK aborted: AI MODE OFF");
+            xQueueReset(s_playback_queue);
+            break;
+        }
+
         if (xQueueReceive(
                 s_playback_queue,
                 &msg,
@@ -793,6 +816,22 @@ static void service_events(uint32_t events)
         play_one_beep();
         vad_reset_after_beep();
     }
+
+    if (events & AUDIO_EVT_AI_ON_BEEP)
+    {
+        ESP_LOGI(TAG, "AI ON confirmation: one beep");
+        play_one_beep();
+        vad_reset_after_beep();
+    }
+
+    if (events & AUDIO_EVT_AI_OFF_BEEP)
+    {
+        ESP_LOGI(TAG, "AI OFF confirmation: two beeps");
+        play_one_beep();
+        vTaskDelay(pdMS_TO_TICKS(90));
+        play_one_beep();
+        vad_reset_after_beep();
+    }
 }
 
 static void audio_owner_task(void *arg)
@@ -895,6 +934,34 @@ static void audio_owner_task(void *arg)
 
             vTaskDelay(
                 pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        /*
+         * AI OFF:
+         * Keep draining the codec/I2S input for hardware stability, but do not
+         * inspect sample energy, run VAD, call the stream callback, or send
+         * anything over the network.
+         */
+        if (!s_ai_enabled)
+        {
+            s_vad_speaking = false;
+            s_vad_start_counter = 0U;
+
+            TickType_t now =
+                xTaskGetTickCount();
+
+            if ((now - last_report) >=
+                pdMS_TO_TICKS(MIC_REPORT_MS))
+            {
+                ESP_LOGI(
+                    TAG,
+                    "AI OFF: mic frames discarded locally; VAD/network disabled");
+                last_report = now;
+            }
+
+            vTaskDelay(
+                pdMS_TO_TICKS(5));
             continue;
         }
 
@@ -1045,6 +1112,65 @@ void koyoda_audio_duplex_set_frame_callback(
 {
     s_frame_callback_ctx = user_ctx;
     s_frame_callback = callback;
+}
+
+void koyoda_audio_duplex_ai_set_enabled(bool enabled)
+{
+    const bool previous = s_ai_enabled;
+
+    if (previous == enabled)
+    {
+        return;
+    }
+
+    s_ai_enabled = enabled;
+
+    /*
+     * Always start a newly-enabled listening session from clean VAD state.
+     * We intentionally do not persist this mode: every reboot resets OFF.
+     */
+    s_vad_speaking = false;
+    s_vad_start_counter = 0U;
+    s_vad_noise_floor = 20U;
+    s_vad_last_voice_tick = xTaskGetTickCount();
+    s_vad_voice_start_tick = 0;
+    s_vad_ignore_until_tick =
+        xTaskGetTickCount() + pdMS_TO_TICKS(VAD_POST_BEEP_IGNORE_MS);
+
+    if (!enabled)
+    {
+        koyoda_face_state_set(KOYODA_FACE_AI_IDLE);
+
+        if (s_playback_queue != NULL)
+        {
+            xQueueReset(s_playback_queue);
+        }
+    }
+
+    TaskHandle_t task = s_audio_task;
+
+    if (task != NULL)
+    {
+        xTaskNotify(
+            task,
+            enabled
+                ? AUDIO_EVT_AI_ON_BEEP
+                : AUDIO_EVT_AI_OFF_BEEP,
+            eSetBits);
+    }
+
+    ESP_LOGI(
+        TAG,
+        "AI MODE %s: %s",
+        enabled ? "ON" : "OFF",
+        enabled
+            ? "VAD + frame streaming enabled"
+            : "mic frames discarded; VAD + streaming disabled");
+}
+
+bool koyoda_audio_duplex_ai_is_enabled(void)
+{
+    return s_ai_enabled;
 }
 
 void koyoda_audio_duplex_beep_charge(void)

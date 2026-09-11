@@ -77,7 +77,17 @@ static void audio_frame_callback(
     void *user_ctx)
 {
     (void)user_ctx;
-    if (s_queue == NULL) return;
+
+    if (s_queue == NULL)
+    {
+        return;
+    }
+
+    if (!koyoda_audio_duplex_ai_is_enabled())
+    {
+        s_prev_vad = false;
+        return;
+    }
 
     bool prev = s_prev_vad;
 
@@ -372,7 +382,7 @@ static void stream_task(void *arg)
 
     ESP_LOGI(
         TAG,
-        "STREAM AI-07 face+duplex ready -> %s:%d",
+        "STREAM AI-07 gated ready -> %s:%d (AI default OFF)",
         CONFIG_KOYODA_STREAM_HOST,
         CONFIG_KOYODA_STREAM_PORT);
 
@@ -384,6 +394,33 @@ static void stream_task(void *arg)
     while (1)
     {
         stream_msg_t msg;
+
+        /*
+         * Explicit user gate.  When OFF:
+         * - close any active PC/cloud socket,
+         * - abort pending playback,
+         * - discard stale utterance queue entries,
+         * - keep the AI face at IDLE.
+         */
+        if (!koyoda_audio_duplex_ai_is_enabled())
+        {
+            if (sock >= 0 || playback_open)
+            {
+                ESP_LOGI(TAG, "AI MODE OFF: closing active AI stream");
+                close_stream_socket(&sock, &playback_open);
+            }
+
+            if (s_queue != NULL)
+            {
+                xQueueReset(s_queue);
+            }
+
+            s_prev_vad = false;
+            koyoda_face_state_set(KOYODA_FACE_AI_IDLE);
+
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
 
         TickType_t wait =
             (sock < 0)

@@ -109,6 +109,21 @@ static volatile koyoda_page_t current_page = PAGE_FACE;
 static lv_point_t swipe_start = {0, 0};
 static bool swipe_tracking = false;
 
+/*
+ * AI trigger:
+ * - AI is OFF every boot.
+ * - Hold the FACE for 1.2 seconds without moving more than 30 px.
+ * - Long-press toggles AI ON/OFF.
+ *
+ * This is deliberately handled by the existing transparent swipe layer so no
+ * second touch object is added on top of the face.
+ */
+#define KOYODA_AI_LONG_PRESS_MS       1200U
+#define KOYODA_AI_LONG_PRESS_MOVE_PX    30
+
+static uint32_t ai_press_started_ms = 0U;
+static bool ai_long_press_fired = false;
+
 /* Wi-Fi and Volume can sit above the transparent global swipe layer while active,
  * so both reuse this same swipe handler directly. */
 static void swipe_event_cb(lv_event_t *e);
@@ -1038,24 +1053,87 @@ static void swipe_event_cb(lv_event_t *e)
     if (indev == NULL || power_dialog_open)
     {
         swipe_tracking = false;
+        ai_long_press_fired = false;
         return;
     }
 
     if (code == LV_EVENT_PRESSED)
     {
         touch_held = true;
+
         bool woke = anim_touch(&animation, lv_tick_get());
-        if (woke) {
+        if (woke)
+        {
+            /*
+             * First touch only wakes KOYODA.  It never also navigates or
+             * toggles AI.
+             */
             swipe_tracking = false;
+            ai_long_press_fired = false;
             ESP_LOGI(TAG, "Wake transition started");
-            return; /* First touch wakes; it never also navigates. */
+            return;
         }
+
         lv_indev_get_point(indev, &swipe_start);
         swipe_tracking = true;
+        ai_press_started_ms = lv_tick_get();
+        ai_long_press_fired = false;
         return;
     }
 
-    if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+    /*
+     * Manual long-press detection gives us a deliberate 1.2 s threshold
+     * instead of depending on LVGL's global/default long-press time.
+     *
+     * It only works on PAGE_FACE and only when the finger has stayed nearly
+     * stationary, so a slow swipe will not accidentally toggle AI.
+     */
+    if (code == LV_EVENT_PRESSING &&
+        current_page == PAGE_FACE &&
+        swipe_tracking &&
+        !ai_long_press_fired)
+    {
+        lv_point_t now_point = {0, 0};
+        lv_indev_get_point(indev, &now_point);
+
+        int dx =
+            (int)now_point.x - (int)swipe_start.x;
+        int dy =
+            (int)now_point.y - (int)swipe_start.y;
+
+        if (abs(dx) <= KOYODA_AI_LONG_PRESS_MOVE_PX &&
+            abs(dy) <= KOYODA_AI_LONG_PRESS_MOVE_PX &&
+            (uint32_t)(lv_tick_get() - ai_press_started_ms) >=
+                KOYODA_AI_LONG_PRESS_MS)
+        {
+            const bool new_enabled =
+                !koyoda_audio_duplex_ai_is_enabled();
+
+            koyoda_audio_duplex_ai_set_enabled(new_enabled);
+
+            /*
+             * Never let a long-press release become a swipe.
+             * The audio module provides:
+             *   ON  -> one confirmation beep
+             *   OFF -> two confirmation beeps
+             */
+            ai_long_press_fired = true;
+            swipe_tracking = false;
+
+            anim_reset(&animation, lv_tick_get());
+
+            ESP_LOGI(
+                TAG,
+                "AI MODE -> %s (face long-press)",
+                new_enabled ? "ON" : "OFF");
+        }
+
+        return;
+    }
+
+    if (code == LV_EVENT_RELEASED ||
+        code == LV_EVENT_PRESS_LOST)
+    {
         touch_held = false;
         anim_touch(&animation, lv_tick_get());
     }
@@ -1063,10 +1141,27 @@ static void swipe_event_cb(lv_event_t *e)
     if (code == LV_EVENT_PRESS_LOST)
     {
         swipe_tracking = false;
+        ai_long_press_fired = false;
         return;
     }
 
-    if (code != LV_EVENT_RELEASED || !swipe_tracking)
+    if (code != LV_EVENT_RELEASED)
+    {
+        return;
+    }
+
+    /*
+     * A completed long-press is consumed here.  No page navigation happens
+     * when the finger is released.
+     */
+    if (ai_long_press_fired)
+    {
+        ai_long_press_fired = false;
+        swipe_tracking = false;
+        return;
+    }
+
+    if (!swipe_tracking)
     {
         return;
     }
@@ -1080,7 +1175,8 @@ static void swipe_event_cb(lv_event_t *e)
     int abs_dx = abs(dx);
     int abs_dy = abs(dy);
 
-    if (abs_dx < KOYODA_SWIPE_THRESHOLD_PX && abs_dy < KOYODA_SWIPE_THRESHOLD_PX)
+    if (abs_dx < KOYODA_SWIPE_THRESHOLD_PX &&
+        abs_dy < KOYODA_SWIPE_THRESHOLD_PX)
     {
         return;
     }
@@ -1093,7 +1189,8 @@ static void swipe_event_cb(lv_event_t *e)
        Physical LEFT  -> negative dominant delta -> next page
        Physical RIGHT -> positive dominant delta -> previous page
      */
-    int dominant_delta = (abs_dy >= abs_dx) ? dy : dx;
+    int dominant_delta =
+        (abs_dy >= abs_dx) ? dy : dx;
 
     if (dominant_delta < 0)
     {
@@ -1118,6 +1215,7 @@ static void create_swipe_layer(lv_obj_t *screen)
     lv_obj_add_flag(swipe_layer, LV_OBJ_FLAG_CLICKABLE);
 
     lv_obj_add_event_cb(swipe_layer, swipe_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(swipe_layer, swipe_event_cb, LV_EVENT_PRESSING, NULL);
     lv_obj_add_event_cb(swipe_layer, swipe_event_cb, LV_EVENT_RELEASED, NULL);
     lv_obj_add_event_cb(swipe_layer, swipe_event_cb, LV_EVENT_PRESS_LOST, NULL);
 }
@@ -1674,6 +1772,11 @@ void app_main(void)
     bsp_display_unlock();
 
     ESP_LOGI(TAG, "KOYODA UI ready: Face <-> Battery <-> Wi-Fi <-> Volume");
+
+    ESP_LOGI(
+        TAG,
+        "AI MODE default OFF; long-press FACE for %u ms to toggle",
+        (unsigned)KOYODA_AI_LONG_PRESS_MS);
 
     /*
      * Wi-Fi Clean Step 1:
