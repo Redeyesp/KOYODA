@@ -79,9 +79,15 @@ static unsigned ai_face_step = 0;
 static uint32_t ai_face_frame_started_ms = 0;
 static void request_charging_animation(void)
 {
-    bsp_display_lock(-1);
-    charging_animation_pending = true;
-    bsp_display_unlock();
+    /*
+     * TEMP DIAGNOSTIC:
+     * Disable only the visual charging animation.
+     *
+     * VBUS detection, battery status and the charge beep on a real insertion
+     * remain active. This prevents ANIM_CHARGE from showing the compact
+     * rotated charging overlay while we test the SPI/DMA freeze.
+     */
+    ESP_LOGI(TAG, "Charge visual skipped for DMA diagnosis");
 }
 
 /* =========================================================
