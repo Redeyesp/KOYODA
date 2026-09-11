@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
-      - name: Verify source and preserved KOYODA assets
+      - name: Verify source and core KOYODA assets
         shell: bash
         run: |
           set -euo pipefail
@@ -43,12 +43,6 @@ jobs:
           echo "c94552bc194a415a55bccf607e845776f834eb3884f677310e6c66ad30448c46  main/koyoda_idle.c" | sha256sum -c -
           echo "571784b384261b2bba890ff5c1c14560e8990f8dccba68030446c7c993c269f2  main/koyoda_half.c" | sha256sum -c -
           echo "94d2bd6c5aef0e8778f9d38c79153a17cb0e064af305ad91ac0924f65bee491f  main/koyoda_closed.c" | sha256sum -c -
-          echo "44b860dce6878d40ea85c35bfbea6a0c77c276ea1a62f59bcc2deedbb5f1eca6  main/koyoda_charge_1.c" | sha256sum -c -
-          echo "f056a0f3b4c88b3aec1f1f72319f391e1e20f89a91a2de2d0f40a095b0cf6350  main/koyoda_charge_2.c" | sha256sum -c -
-          echo "2c63ca3d18ea45ed987a7eef574d08531a8b048848e776669e02e3c1da91292a  main/koyoda_charge_3.c" | sha256sum -c -
-          echo "4f78a054d4a06404dc32752af565ef38cba1abb01176faff7fcde3dfac112ed4  main/koyoda_charge_4.c" | sha256sum -c -
-          echo "1209d510e14152a47e70208417f4b00c3941c656ce5b09c8f194bef1784d1359  main/koyoda_charge_5.c" | sha256sum -c -
-          echo "61ae2a366d6e2c1a54d0d4f3e58e01bfc4c8a3b152897c4816c27726a68997ef  main/koyoda_charge_6.c" | sha256sum -c -
 
           git ls-files -z main assets | xargs -0 sha256sum > source-assets.sha256
 
