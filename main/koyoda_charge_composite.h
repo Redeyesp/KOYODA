@@ -8,16 +8,22 @@ extern "C" {
 #endif
 
 /*
- * Charge LITE v2
+ * Shared KOYODA face compositor.
  *
- * Uses one full-screen RGB565 work frame in external PSRAM. The frame is
- * initialized from koyoda_idle and only the compact charge mouth/electricity
- * rectangle is changed. main.c renders it through the existing face_img.
- * There is NO separate charging LVGL overlay object.
+ * Charge LITE v2 already allocates one 466x466 RGB565 work frame in PSRAM.
+ * Blink LITE v4 REUSES that exact same work frame.
+ *
+ * Nothing here creates a separate rotated LVGL overlay object for blink or
+ * charging.  The completed full-screen composite is rendered through face_img,
+ * which is the path already proven stable on hardware.
  */
 bool koyoda_charge_composite_init(void);
+
 bool koyoda_charge_composite_apply(unsigned step);
 const lv_image_dsc_t *koyoda_charge_composite_image(unsigned step);
+
+bool koyoda_blink_composite_apply(unsigned frame_id);
+const lv_image_dsc_t *koyoda_blink_composite_image(unsigned frame_id);
 
 #ifdef __cplusplus
 }

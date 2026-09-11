@@ -23,8 +23,6 @@
 #include "koyoda_charge_composite.h"
 
 LV_IMAGE_DECLARE(koyoda_idle);
-LV_IMAGE_DECLARE(koyoda_half);
-LV_IMAGE_DECLARE(koyoda_closed);
 LV_IMAGE_DECLARE(koyoda_sleep_1);
 LV_IMAGE_DECLARE(koyoda_sleep_2);
 LV_IMAGE_DECLARE(koyoda_sleep_3);
@@ -78,6 +76,7 @@ static koyoda_face_ai_state_t ai_face_prev_state = KOYODA_FACE_AI_IDLE;
 static unsigned ai_face_step = 0;
 static uint32_t ai_face_frame_started_ms = 0;
 static int charge_rendered_step = -1;
+static int blink_rendered_frame = -1;
 static void request_charging_animation(void)
 {
     bsp_display_lock(-1);
@@ -1344,8 +1343,13 @@ static void face_animation_step(void)
         }
     }
 
+    /*
+     * BLINK LITE v4:
+     * frame IDs 1/2 are composed into the shared PSRAM face frame below.
+     * They no longer require full-screen koyoda_half/koyoda_closed assets.
+     */
     const lv_image_dsc_t *normal_frames[] = {
-        &koyoda_idle, &koyoda_half, &koyoda_closed,
+        &koyoda_idle, &koyoda_idle, &koyoda_idle,
         &koyoda_sleep_1, &koyoda_sleep_2, &koyoda_sleep_3
     };
 
@@ -1456,10 +1460,35 @@ static void face_animation_step(void)
             }
 
             desired_face = koyoda_charge_composite_image(animation.step);
+            blink_rendered_frame = -1;
         }
         else
         {
             charge_rendered_step = -1;
+
+            /*
+             * BLINK LITE v4:
+             * half/closed are eye-only compact patches copied into the SAME
+             * full-screen PSRAM work frame already used by charging.
+             * No extra 466x466 allocation and no LVGL eye overlay objects.
+             *
+             * This also handles DROWSY and WAKE, because those modes use the
+             * same frame IDs 1=half and 2=closed.
+             */
+            if (frame == 1U || frame == 2U)
+            {
+                if ((int)frame != blink_rendered_frame)
+                {
+                    (void)koyoda_blink_composite_apply(frame);
+                    blink_rendered_frame = (int)frame;
+                }
+
+                desired_face = koyoda_blink_composite_image(frame);
+            }
+            else
+            {
+                blink_rendered_frame = -1;
+            }
         }
 
         /*
@@ -1591,7 +1620,7 @@ void app_main(void)
 
     if (!koyoda_charge_composite_init())
     {
-        ESP_LOGW(TAG, "Charge composite buffer unavailable; charge visual will stay idle");
+        ESP_LOGW(TAG, "Shared face composite buffer unavailable; charge/blink visual will stay idle");
     }
 
     bsp_display_lock(-1);

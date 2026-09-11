@@ -2,8 +2,6 @@ idf_component_register(
     SRCS "main.c"
          "pmu_bridge.cpp"
          "koyoda_idle.c"
-         "koyoda_half.c"
-         "koyoda_closed.c"
          "koyoda_sleep_1.c"
          "koyoda_sleep_2.c"
          "koyoda_sleep_3.c"
@@ -13,6 +11,7 @@ idf_component_register(
          "koyoda_face_state.c"
          "koyoda_ai_overlays.c"
          "koyoda_charge_composite.c"
+         "koyoda_blink_patches.c"
     INCLUDE_DIRS "."
     REQUIRES
          XPowersLib

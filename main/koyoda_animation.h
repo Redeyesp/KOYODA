@@ -27,8 +27,8 @@ typedef struct
  * 2  = closed
  * 3..5  = sleep 1..3
  *
- * Charging no longer needs full-screen frame IDs.  ANIM_CHARGE keeps
- * the base face on idle while main.c selects a tiny mouth/electricity overlay.
+ * Charging no longer needs full-screen frame IDs. ANIM_CHARGE keeps
+ * the base face on idle while main.c uses the shared PSRAM compositor.
  */
 static const unsigned anim_idle_frames[]   = {0, 1, 2, 1};
 static const uint16_t anim_idle_ms[]       = {3000, 60, 90, 60};
