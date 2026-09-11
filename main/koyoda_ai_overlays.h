@@ -36,6 +36,22 @@ extern const lv_image_dsc_t koyoda_charge_patch_bite;
 extern const lv_image_dsc_t koyoda_charge_patch_bolt;
 extern const lv_image_dsc_t koyoda_charge_patch_glow;
 
+
+#define KOYODA_BLINK_LEFT_X 50
+#define KOYODA_BLINK_LEFT_Y 115
+#define KOYODA_BLINK_LEFT_W 155
+#define KOYODA_BLINK_LEFT_H 165
+
+#define KOYODA_BLINK_RIGHT_X 260
+#define KOYODA_BLINK_RIGHT_Y 115
+#define KOYODA_BLINK_RIGHT_W 155
+#define KOYODA_BLINK_RIGHT_H 165
+
+extern const lv_image_dsc_t koyoda_blink_half_left;
+extern const lv_image_dsc_t koyoda_blink_half_right;
+extern const lv_image_dsc_t koyoda_blink_closed_left;
+extern const lv_image_dsc_t koyoda_blink_closed_right;
+
 #ifdef __cplusplus
 }
 #endif

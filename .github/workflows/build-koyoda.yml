@@ -41,8 +41,6 @@ jobs:
           grep -qx 'CONFIG_IDF_TARGET="esp32s3"' sdkconfig
 
           echo "c94552bc194a415a55bccf607e845776f834eb3884f677310e6c66ad30448c46  main/koyoda_idle.c" | sha256sum -c -
-          echo "571784b384261b2bba890ff5c1c14560e8990f8dccba68030446c7c993c269f2  main/koyoda_half.c" | sha256sum -c -
-          echo "94d2bd6c5aef0e8778f9d38c79153a17cb0e064af305ad91ac0924f65bee491f  main/koyoda_closed.c" | sha256sum -c -
 
           git ls-files -z main assets | xargs -0 sha256sum > source-assets.sha256
 
@@ -186,7 +184,7 @@ jobs:
               "ESP-IDF: v5.5.4\n"
               "Target: esp32s3\n"
               f"Factory partition: {factory_size} at offset 0x10000.\n"
-              "Current face and charging assets verified unchanged.\n"
+              "Current KOYODA source/assets verified unchanged.\n"
           )
 
           (out / "FLASH-WINDOWS.txt").write_text(

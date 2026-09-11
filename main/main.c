@@ -22,8 +22,6 @@
 #include "koyoda_ai_overlays.h"
 
 LV_IMAGE_DECLARE(koyoda_idle);
-LV_IMAGE_DECLARE(koyoda_half);
-LV_IMAGE_DECLARE(koyoda_closed);
 LV_IMAGE_DECLARE(koyoda_sleep_1);
 LV_IMAGE_DECLARE(koyoda_sleep_2);
 LV_IMAGE_DECLARE(koyoda_sleep_3);
@@ -34,6 +32,8 @@ static lv_obj_t *face_img = NULL;
 static lv_obj_t *thinking_overlay_img = NULL;
 static lv_obj_t *speaking_overlay_img = NULL;
 static lv_obj_t *charging_overlay_img = NULL;
+static lv_obj_t *blink_left_overlay_img = NULL;
+static lv_obj_t *blink_right_overlay_img = NULL;
 static lv_obj_t *power_overlay = NULL;
 static lv_obj_t *battery_page = NULL;
 static lv_obj_t *battery_fill = NULL;
@@ -857,7 +857,7 @@ static void create_volume_page(lv_obj_t *screen)
     lv_obj_align(sound_label, LV_ALIGN_CENTER, 0, -86);
 
     volume_percent_label = lv_label_create(volume_page);
-    lv_label_set_text(volume_percent_label, "25%");
+    lv_label_set_text(volume_percent_label, "90%");
     lv_obj_set_style_text_color(
         volume_percent_label,
         lv_color_hex(0xFFFFFF),
@@ -954,6 +954,8 @@ static void set_page_from_lvgl(koyoda_page_t page)
     if (thinking_overlay_img) lv_obj_add_flag(thinking_overlay_img, LV_OBJ_FLAG_HIDDEN);
     if (speaking_overlay_img) lv_obj_add_flag(speaking_overlay_img, LV_OBJ_FLAG_HIDDEN);
     if (charging_overlay_img) lv_obj_add_flag(charging_overlay_img, LV_OBJ_FLAG_HIDDEN);
+    if (blink_left_overlay_img) lv_obj_add_flag(blink_left_overlay_img, LV_OBJ_FLAG_HIDDEN);
+    if (blink_right_overlay_img) lv_obj_add_flag(blink_right_overlay_img, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(wifi_page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(volume_page, LV_OBJ_FLAG_HIDDEN);
@@ -1344,8 +1346,13 @@ static void face_animation_step(void)
         }
     }
 
+    /*
+     * BLINK LITE:
+     * frame IDs 1 and 2 no longer point to full-screen half/closed images.
+     * The base remains koyoda_idle and only two small eye overlays change.
+     */
     const lv_image_dsc_t *normal_frames[] = {
-        &koyoda_idle, &koyoda_half, &koyoda_closed,
+        &koyoda_idle, &koyoda_idle, &koyoda_idle,
         &koyoda_sleep_1, &koyoda_sleep_2, &koyoda_sleep_3
     };
 
@@ -1405,6 +1412,8 @@ static void face_animation_step(void)
     const lv_image_dsc_t *desired_thinking_patch = NULL;
     const lv_image_dsc_t *desired_speaking_patch = NULL;
     const lv_image_dsc_t *desired_charging_patch = NULL;
+    const lv_image_dsc_t *desired_blink_left_patch = NULL;
+    const lv_image_dsc_t *desired_blink_right_patch = NULL;
 
     if (ai_state == KOYODA_FACE_AI_THINKING)
     {
@@ -1449,6 +1458,24 @@ static void face_animation_step(void)
         desired_face = normal_frames[frame];
 
         /*
+         * BLINK LITE:
+         * The existing animation state machine still returns frame 1 (half)
+         * and frame 2 (closed), but only the eyes are redrawn.
+         * This also preserves drowsy and wake behavior without full-screen
+         * half/closed assets.
+         */
+        if (frame == 1U)
+        {
+            desired_blink_left_patch = &koyoda_blink_half_left;
+            desired_blink_right_patch = &koyoda_blink_half_right;
+        }
+        else if (frame == 2U)
+        {
+            desired_blink_left_patch = &koyoda_blink_closed_left;
+            desired_blink_right_patch = &koyoda_blink_closed_right;
+        }
+
+        /*
          * Charge LITE: anim_tick keeps the base on frame 0 (idle).
          * Only the mouth/electricity area is overlaid.
          */
@@ -1476,6 +1503,32 @@ static void face_animation_step(void)
         lv_image_get_src(face_img) != desired_face)
     {
         lv_image_set_src(face_img, desired_face);
+    }
+
+    if (!face_visible || desired_blink_left_patch == NULL)
+    {
+        lv_obj_add_flag(blink_left_overlay_img, LV_OBJ_FLAG_HIDDEN);
+    }
+    else
+    {
+        if (lv_image_get_src(blink_left_overlay_img) != desired_blink_left_patch)
+        {
+            lv_image_set_src(blink_left_overlay_img, desired_blink_left_patch);
+        }
+        lv_obj_clear_flag(blink_left_overlay_img, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (!face_visible || desired_blink_right_patch == NULL)
+    {
+        lv_obj_add_flag(blink_right_overlay_img, LV_OBJ_FLAG_HIDDEN);
+    }
+    else
+    {
+        if (lv_image_get_src(blink_right_overlay_img) != desired_blink_right_patch)
+        {
+            lv_image_set_src(blink_right_overlay_img, desired_blink_right_patch);
+        }
+        lv_obj_clear_flag(blink_right_overlay_img, LV_OBJ_FLAG_HIDDEN);
     }
 
     if (!face_visible || desired_thinking_patch == NULL)
@@ -1609,6 +1662,32 @@ void app_main(void)
     lv_image_set_pivot(face_img, 233, 233);
     lv_image_set_rotation(face_img, 900);
     lv_obj_center(face_img);
+
+    /*
+     * BLINK LITE overlays use the same global pivot as face_img.
+     * They are hidden except during half/closed blink frames.
+     */
+    blink_left_overlay_img = lv_image_create(screen);
+    lv_image_set_src(blink_left_overlay_img, &koyoda_blink_half_left);
+    lv_obj_set_pos(blink_left_overlay_img,
+                   KOYODA_BLINK_LEFT_X,
+                   KOYODA_BLINK_LEFT_Y);
+    lv_image_set_pivot(blink_left_overlay_img,
+                       233 - KOYODA_BLINK_LEFT_X,
+                       233 - KOYODA_BLINK_LEFT_Y);
+    lv_image_set_rotation(blink_left_overlay_img, 900);
+    lv_obj_add_flag(blink_left_overlay_img, LV_OBJ_FLAG_HIDDEN);
+
+    blink_right_overlay_img = lv_image_create(screen);
+    lv_image_set_src(blink_right_overlay_img, &koyoda_blink_half_right);
+    lv_obj_set_pos(blink_right_overlay_img,
+                   KOYODA_BLINK_RIGHT_X,
+                   KOYODA_BLINK_RIGHT_Y);
+    lv_image_set_pivot(blink_right_overlay_img,
+                       233 - KOYODA_BLINK_RIGHT_X,
+                       233 - KOYODA_BLINK_RIGHT_Y);
+    lv_image_set_rotation(blink_right_overlay_img, 900);
+    lv_obj_add_flag(blink_right_overlay_img, LV_OBJ_FLAG_HIDDEN);
 
     /*
      * Tiny AI overlays use the same global rotation pivot as the 466x466

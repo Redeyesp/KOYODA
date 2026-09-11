@@ -49,7 +49,7 @@ static const char *TAG = "KOYODA_AUDIO";
 #define MIC_GAIN_DB                     24.0f
 #define MIC_REPORT_MS                    1000
 
-#define DEFAULT_VOLUME_PERCENT             25
+#define DEFAULT_VOLUME_PERCENT             90
 #define BEEP_TONE_HZ                      660
 #define BEEP_TONE_MS                      120
 #define BEEP_CHUNK_SAMPLES                128
@@ -109,6 +109,8 @@ typedef struct
 
 #define NVS_NAMESPACE "koyoda_audio"
 #define NVS_KEY_VOLUME "volume"
+#define NVS_KEY_VOLUME_SCHEMA "vol_schema"
+#define VOLUME_SCHEMA_VERSION 2U
 
 static TaskHandle_t s_audio_task = NULL;
 static QueueHandle_t s_playback_queue = NULL;
@@ -318,9 +320,16 @@ static void load_volume_from_nvs(void)
 {
     nvs_handle_t handle = 0;
 
+    /*
+     * Volume schema v2 changes KOYODA's initial/default level from 25% to 90%.
+     * On the first boot of this firmware we migrate only the audio namespace
+     * once, so the existing device also starts at 90% without erasing Wi-Fi
+     * credentials or the rest of NVS.  After that, user volume changes remain
+     * persistent exactly as before.
+     */
     esp_err_t err = nvs_open(
         NVS_NAMESPACE,
-        NVS_READONLY,
+        NVS_READWRITE,
         &handle);
 
     if (err != ESP_OK)
@@ -331,6 +340,55 @@ static void load_volume_from_nvs(void)
             TAG,
             "Using default volume: %d%%",
             DEFAULT_VOLUME_PERCENT);
+        return;
+    }
+
+    uint8_t schema = 0U;
+    esp_err_t schema_err = nvs_get_u8(
+        handle,
+        NVS_KEY_VOLUME_SCHEMA,
+        &schema);
+
+    if (schema_err != ESP_OK ||
+        schema < VOLUME_SCHEMA_VERSION)
+    {
+        s_volume_percent = DEFAULT_VOLUME_PERCENT;
+
+        esp_err_t write_err = nvs_set_u8(
+            handle,
+            NVS_KEY_VOLUME,
+            (uint8_t)DEFAULT_VOLUME_PERCENT);
+
+        if (write_err == ESP_OK)
+        {
+            write_err = nvs_set_u8(
+                handle,
+                NVS_KEY_VOLUME_SCHEMA,
+                (uint8_t)VOLUME_SCHEMA_VERSION);
+        }
+
+        if (write_err == ESP_OK)
+        {
+            write_err = nvs_commit(handle);
+        }
+
+        nvs_close(handle);
+
+        if (write_err == ESP_OK)
+        {
+            ESP_LOGI(
+                TAG,
+                "Volume default migrated to %d%%",
+                DEFAULT_VOLUME_PERCENT);
+        }
+        else
+        {
+            ESP_LOGW(
+                TAG,
+                "Volume migration save failed: %s",
+                esp_err_to_name(write_err));
+        }
+
         return;
     }
 
