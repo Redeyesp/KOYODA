@@ -184,7 +184,7 @@ jobs:
               "ESP-IDF: v5.5.4\n"
               "Target: esp32s3\n"
               f"Factory partition: {factory_size} at offset 0x10000.\n"
-              "Current KOYODA source/assets verified unchanged.\n"
+              "Current face and charging assets verified unchanged.\n"
           )
 
           (out / "FLASH-WINDOWS.txt").write_text(

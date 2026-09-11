@@ -1346,11 +1346,6 @@ static void face_animation_step(void)
         }
     }
 
-    /*
-     * BLINK LITE:
-     * frame IDs 1 and 2 no longer point to full-screen half/closed images.
-     * The base remains koyoda_idle and only two small eye overlays change.
-     */
     const lv_image_dsc_t *normal_frames[] = {
         &koyoda_idle, &koyoda_idle, &koyoda_idle,
         &koyoda_sleep_1, &koyoda_sleep_2, &koyoda_sleep_3
@@ -1457,13 +1452,7 @@ static void face_animation_step(void)
 
         desired_face = normal_frames[frame];
 
-        /*
-         * BLINK LITE:
-         * The existing animation state machine still returns frame 1 (half)
-         * and frame 2 (closed), but only the eyes are redrawn.
-         * This also preserves drowsy and wake behavior without full-screen
-         * half/closed assets.
-         */
+        /* BLINK LITE v2: only the eye regions change. */
         if (frame == 1U)
         {
             desired_blink_left_patch = &koyoda_blink_half_left;
@@ -1663,10 +1652,7 @@ void app_main(void)
     lv_image_set_rotation(face_img, 900);
     lv_obj_center(face_img);
 
-    /*
-     * BLINK LITE overlays use the same global pivot as face_img.
-     * They are hidden except during half/closed blink frames.
-     */
+    /* Eye-only blink overlays; mouth and cheeks remain from koyoda_idle. */
     blink_left_overlay_img = lv_image_create(screen);
     lv_image_set_src(blink_left_overlay_img, &koyoda_blink_half_left);
     lv_obj_set_pos(blink_left_overlay_img,

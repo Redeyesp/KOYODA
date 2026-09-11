@@ -320,13 +320,6 @@ static void load_volume_from_nvs(void)
 {
     nvs_handle_t handle = 0;
 
-    /*
-     * Volume schema v2 changes KOYODA's initial/default level from 25% to 90%.
-     * On the first boot of this firmware we migrate only the audio namespace
-     * once, so the existing device also starts at 90% without erasing Wi-Fi
-     * credentials or the rest of NVS.  After that, user volume changes remain
-     * persistent exactly as before.
-     */
     esp_err_t err = nvs_open(
         NVS_NAMESPACE,
         NVS_READWRITE,
@@ -335,11 +328,7 @@ static void load_volume_from_nvs(void)
     if (err != ESP_OK)
     {
         s_volume_percent = DEFAULT_VOLUME_PERCENT;
-
-        ESP_LOGI(
-            TAG,
-            "Using default volume: %d%%",
-            DEFAULT_VOLUME_PERCENT);
+        ESP_LOGI(TAG, "Using default volume: %d%%", DEFAULT_VOLUME_PERCENT);
         return;
     }
 
@@ -349,8 +338,7 @@ static void load_volume_from_nvs(void)
         NVS_KEY_VOLUME_SCHEMA,
         &schema);
 
-    if (schema_err != ESP_OK ||
-        schema < VOLUME_SCHEMA_VERSION)
+    if (schema_err != ESP_OK || schema < VOLUME_SCHEMA_VERSION)
     {
         s_volume_percent = DEFAULT_VOLUME_PERCENT;
 
@@ -376,48 +364,30 @@ static void load_volume_from_nvs(void)
 
         if (write_err == ESP_OK)
         {
-            ESP_LOGI(
-                TAG,
-                "Volume default migrated to %d%%",
-                DEFAULT_VOLUME_PERCENT);
+            ESP_LOGI(TAG, "Volume default migrated to %d%%", DEFAULT_VOLUME_PERCENT);
         }
         else
         {
-            ESP_LOGW(
-                TAG,
-                "Volume migration save failed: %s",
-                esp_err_to_name(write_err));
+            ESP_LOGW(TAG, "Volume migration save failed: %s",
+                     esp_err_to_name(write_err));
         }
-
         return;
     }
 
     uint8_t saved = DEFAULT_VOLUME_PERCENT;
-
-    err = nvs_get_u8(
-        handle,
-        NVS_KEY_VOLUME,
-        &saved);
-
+    err = nvs_get_u8(handle, NVS_KEY_VOLUME, &saved);
     nvs_close(handle);
 
     if (err == ESP_OK)
     {
         s_volume_percent = clamp_volume((int)saved);
-
-        ESP_LOGI(
-            TAG,
-            "Loaded saved volume: %d%%",
-            (int)s_volume_percent);
+        ESP_LOGI(TAG, "Loaded saved volume: %d%%", (int)s_volume_percent);
     }
     else
     {
         s_volume_percent = DEFAULT_VOLUME_PERCENT;
-
-        ESP_LOGI(
-            TAG,
-            "No saved volume; using default %d%%",
-            DEFAULT_VOLUME_PERCENT);
+        ESP_LOGI(TAG, "No saved volume; using default %d%%",
+                 DEFAULT_VOLUME_PERCENT);
     }
 }
 
