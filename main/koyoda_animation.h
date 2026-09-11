@@ -26,7 +26,9 @@ typedef struct
  * 1  = half
  * 2  = closed
  * 3..5  = sleep 1..3
- * 6..11 = charging 1..6
+ *
+ * Charging no longer needs full-screen frame IDs.  ANIM_CHARGE keeps
+ * the base face on idle while main.c selects a tiny mouth/electricity overlay.
  */
 static const unsigned anim_idle_frames[]   = {0, 1, 2, 1};
 static const uint16_t anim_idle_ms[]       = {3000, 60, 90, 60};
@@ -37,8 +39,15 @@ static const uint16_t anim_drowsy_ms[]     = {600, 800, 500, 500};
 static const unsigned anim_sleep_frames[]  = {3, 4, 5, 4, 3};
 static const uint16_t anim_sleep_ms[]      = {800, 800, 1000, 800, 800};
 
-static const unsigned anim_charge_frames[] = {6, 7, 8, 9, 10, 11, 10, 6};
-static const uint16_t anim_charge_ms[]     = {120, 100, 100, 120, 100, 450, 100, 400};
+/*
+ * One-shot "eat electricity" sequence on VBUS insertion:
+ * idle -> taste -> bite -> lightning gulp -> glow/swallow -> idle
+ *
+ * All frame IDs stay 0 because koyoda_idle is the base image throughout.
+ * main.c chooses the compact overlay from animation.step.
+ */
+static const unsigned anim_charge_frames[] = {0, 0, 0, 0, 0, 0};
+static const uint16_t anim_charge_ms[]     = {180, 160, 180, 260, 220, 350};
 
 /*
  * Tap-to-wake sequence requested:
@@ -141,7 +150,7 @@ static inline unsigned anim_tick(
         case ANIM_CHARGE:
             frames = anim_charge_frames;
             delays = anim_charge_ms;
-            count = 8;
+            count = 6;
             break;
 
         case ANIM_WAKE:

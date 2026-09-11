@@ -25,6 +25,17 @@ extern const lv_image_dsc_t koyoda_speak_patch_closed;
 extern const lv_image_dsc_t koyoda_speak_patch_soft;
 extern const lv_image_dsc_t koyoda_speak_patch_open;
 
+
+#define KOYODA_CHARGE_PATCH_X 180
+#define KOYODA_CHARGE_PATCH_Y 280
+#define KOYODA_CHARGE_PATCH_W 106
+#define KOYODA_CHARGE_PATCH_H 125
+
+extern const lv_image_dsc_t koyoda_charge_patch_taste;
+extern const lv_image_dsc_t koyoda_charge_patch_bite;
+extern const lv_image_dsc_t koyoda_charge_patch_bolt;
+extern const lv_image_dsc_t koyoda_charge_patch_glow;
+
 #ifdef __cplusplus
 }
 #endif

@@ -24,12 +24,6 @@
 LV_IMAGE_DECLARE(koyoda_idle);
 LV_IMAGE_DECLARE(koyoda_half);
 LV_IMAGE_DECLARE(koyoda_closed);
-LV_IMAGE_DECLARE(koyoda_charge_1);
-LV_IMAGE_DECLARE(koyoda_charge_2);
-LV_IMAGE_DECLARE(koyoda_charge_3);
-LV_IMAGE_DECLARE(koyoda_charge_4);
-LV_IMAGE_DECLARE(koyoda_charge_5);
-LV_IMAGE_DECLARE(koyoda_charge_6);
 LV_IMAGE_DECLARE(koyoda_sleep_1);
 LV_IMAGE_DECLARE(koyoda_sleep_2);
 LV_IMAGE_DECLARE(koyoda_sleep_3);
@@ -39,6 +33,7 @@ static const char *TAG = "KOYODA";
 static lv_obj_t *face_img = NULL;
 static lv_obj_t *thinking_overlay_img = NULL;
 static lv_obj_t *speaking_overlay_img = NULL;
+static lv_obj_t *charging_overlay_img = NULL;
 static lv_obj_t *power_overlay = NULL;
 static lv_obj_t *battery_page = NULL;
 static lv_obj_t *battery_fill = NULL;
@@ -958,6 +953,7 @@ static void set_page_from_lvgl(koyoda_page_t page)
     lv_obj_add_flag(face_img, LV_OBJ_FLAG_HIDDEN);
     if (thinking_overlay_img) lv_obj_add_flag(thinking_overlay_img, LV_OBJ_FLAG_HIDDEN);
     if (speaking_overlay_img) lv_obj_add_flag(speaking_overlay_img, LV_OBJ_FLAG_HIDDEN);
+    if (charging_overlay_img) lv_obj_add_flag(charging_overlay_img, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(wifi_page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(volume_page, LV_OBJ_FLAG_HIDDEN);
@@ -1350,9 +1346,21 @@ static void face_animation_step(void)
 
     const lv_image_dsc_t *normal_frames[] = {
         &koyoda_idle, &koyoda_half, &koyoda_closed,
-        &koyoda_sleep_1, &koyoda_sleep_2, &koyoda_sleep_3,
-        &koyoda_charge_1, &koyoda_charge_2, &koyoda_charge_3,
-        &koyoda_charge_4, &koyoda_charge_5, &koyoda_charge_6
+        &koyoda_sleep_1, &koyoda_sleep_2, &koyoda_sleep_3
+    };
+
+    /*
+     * CHARGE LITE:
+     * The eyes/cheeks/body remain exactly koyoda_idle.  Only the compact
+     * mouth/electricity patch changes during the one-shot VBUS animation.
+     */
+    const lv_image_dsc_t *charging_frames[] = {
+        NULL,
+        &koyoda_charge_patch_taste,
+        &koyoda_charge_patch_bite,
+        &koyoda_charge_patch_bolt,
+        &koyoda_charge_patch_glow,
+        NULL,
     };
 
     /*
@@ -1396,6 +1404,7 @@ static void face_animation_step(void)
     const lv_image_dsc_t *desired_face = NULL;
     const lv_image_dsc_t *desired_thinking_patch = NULL;
     const lv_image_dsc_t *desired_speaking_patch = NULL;
+    const lv_image_dsc_t *desired_charging_patch = NULL;
 
     if (ai_state == KOYODA_FACE_AI_THINKING)
     {
@@ -1438,6 +1447,15 @@ static void face_animation_step(void)
             &charging_animation_pending);
 
         desired_face = normal_frames[frame];
+
+        /*
+         * Charge LITE: anim_tick keeps the base on frame 0 (idle).
+         * Only the mouth/electricity area is overlaid.
+         */
+        if (animation.mode == ANIM_CHARGE && animation.step < 6U)
+        {
+            desired_charging_patch = charging_frames[animation.step];
+        }
 
         /*
          * Wake expression without a full-screen fun_happy asset:
@@ -1484,6 +1502,19 @@ static void face_animation_step(void)
             lv_image_set_src(speaking_overlay_img, desired_speaking_patch);
         }
         lv_obj_clear_flag(speaking_overlay_img, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (!face_visible || desired_charging_patch == NULL)
+    {
+        lv_obj_add_flag(charging_overlay_img, LV_OBJ_FLAG_HIDDEN);
+    }
+    else
+    {
+        if (lv_image_get_src(charging_overlay_img) != desired_charging_patch)
+        {
+            lv_image_set_src(charging_overlay_img, desired_charging_patch);
+        }
+        lv_obj_clear_flag(charging_overlay_img, LV_OBJ_FLAG_HIDDEN);
     }
 
     /*
@@ -1605,6 +1636,17 @@ void app_main(void)
                        233 - KOYODA_SPEAK_PATCH_Y);
     lv_image_set_rotation(speaking_overlay_img, 900);
     lv_obj_add_flag(speaking_overlay_img, LV_OBJ_FLAG_HIDDEN);
+
+    charging_overlay_img = lv_image_create(screen);
+    lv_image_set_src(charging_overlay_img, &koyoda_charge_patch_taste);
+    lv_obj_set_pos(charging_overlay_img,
+                   KOYODA_CHARGE_PATCH_X,
+                   KOYODA_CHARGE_PATCH_Y);
+    lv_image_set_pivot(charging_overlay_img,
+                       233 - KOYODA_CHARGE_PATCH_X,
+                       233 - KOYODA_CHARGE_PATCH_Y);
+    lv_image_set_rotation(charging_overlay_img, 900);
+    lv_obj_add_flag(charging_overlay_img, LV_OBJ_FLAG_HIDDEN);
 
     create_battery_page(screen);
     create_wifi_page(screen);
