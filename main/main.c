@@ -20,6 +20,7 @@
 #include "koyoda_audio_stream.h"
 #include "koyoda_face_state.h"
 #include "koyoda_ai_overlays.h"
+#include "koyoda_charge_composite.h"
 
 LV_IMAGE_DECLARE(koyoda_idle);
 LV_IMAGE_DECLARE(koyoda_half);
@@ -33,7 +34,6 @@ static const char *TAG = "KOYODA";
 static lv_obj_t *face_img = NULL;
 static lv_obj_t *thinking_overlay_img = NULL;
 static lv_obj_t *speaking_overlay_img = NULL;
-static lv_obj_t *charging_overlay_img = NULL;
 static lv_obj_t *power_overlay = NULL;
 static lv_obj_t *battery_page = NULL;
 static lv_obj_t *battery_fill = NULL;
@@ -77,17 +77,12 @@ static bool touch_held;
 static koyoda_face_ai_state_t ai_face_prev_state = KOYODA_FACE_AI_IDLE;
 static unsigned ai_face_step = 0;
 static uint32_t ai_face_frame_started_ms = 0;
+static int charge_rendered_step = -1;
 static void request_charging_animation(void)
 {
-    /*
-     * TEMP DIAGNOSTIC:
-     * Disable only the visual charging animation.
-     *
-     * VBUS detection, battery status and the charge beep on a real insertion
-     * remain active. This prevents ANIM_CHARGE from showing the compact
-     * rotated charging overlay while we test the SPI/DMA freeze.
-     */
-    ESP_LOGI(TAG, "Charge visual skipped for DMA diagnosis");
+    bsp_display_lock(-1);
+    charging_animation_pending = true;
+    bsp_display_unlock();
 }
 
 /* =========================================================
@@ -959,7 +954,6 @@ static void set_page_from_lvgl(koyoda_page_t page)
     lv_obj_add_flag(face_img, LV_OBJ_FLAG_HIDDEN);
     if (thinking_overlay_img) lv_obj_add_flag(thinking_overlay_img, LV_OBJ_FLAG_HIDDEN);
     if (speaking_overlay_img) lv_obj_add_flag(speaking_overlay_img, LV_OBJ_FLAG_HIDDEN);
-    if (charging_overlay_img) lv_obj_add_flag(charging_overlay_img, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(wifi_page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(volume_page, LV_OBJ_FLAG_HIDDEN);
@@ -1356,18 +1350,10 @@ static void face_animation_step(void)
     };
 
     /*
-     * CHARGE LITE:
-     * The eyes/cheeks/body remain exactly koyoda_idle.  Only the compact
-     * mouth/electricity patch changes during the one-shot VBUS animation.
+     * CHARGE LITE v2 uses the existing full-screen face object, not a
+     * separate LVGL image overlay.  A single PSRAM work frame is composed
+     * from koyoda_idle + the tiny mouth/electricity patch.
      */
-    const lv_image_dsc_t *charging_frames[] = {
-        NULL,
-        &koyoda_charge_patch_taste,
-        &koyoda_charge_patch_bite,
-        &koyoda_charge_patch_bolt,
-        &koyoda_charge_patch_glow,
-        NULL,
-    };
 
     /*
      * AI-07 LITE:
@@ -1410,7 +1396,6 @@ static void face_animation_step(void)
     const lv_image_dsc_t *desired_face = NULL;
     const lv_image_dsc_t *desired_thinking_patch = NULL;
     const lv_image_dsc_t *desired_speaking_patch = NULL;
-    const lv_image_dsc_t *desired_charging_patch = NULL;
 
     if (ai_state == KOYODA_FACE_AI_THINKING)
     {
@@ -1455,12 +1440,26 @@ static void face_animation_step(void)
         desired_face = normal_frames[frame];
 
         /*
-         * Charge LITE: anim_tick keeps the base on frame 0 (idle).
-         * Only the mouth/electricity area is overlaid.
+         * Charge LITE v2:
+         * Keep the animation state/timing from koyoda_animation.h, but do
+         * not create a rotated LVGL overlay.  Steps 1..4 are composed into
+         * one full-screen PSRAM work frame and rendered through face_img,
+         * the same path used by the historically stable full-screen faces.
          */
-        if (animation.mode == ANIM_CHARGE && animation.step < 6U)
+        if (animation.mode == ANIM_CHARGE &&
+            animation.step >= 1U && animation.step <= 4U)
         {
-            desired_charging_patch = charging_frames[animation.step];
+            if ((int)animation.step != charge_rendered_step)
+            {
+                (void)koyoda_charge_composite_apply(animation.step);
+                charge_rendered_step = (int)animation.step;
+            }
+
+            desired_face = koyoda_charge_composite_image(animation.step);
+        }
+        else
+        {
+            charge_rendered_step = -1;
         }
 
         /*
@@ -1508,19 +1507,6 @@ static void face_animation_step(void)
             lv_image_set_src(speaking_overlay_img, desired_speaking_patch);
         }
         lv_obj_clear_flag(speaking_overlay_img, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    if (!face_visible || desired_charging_patch == NULL)
-    {
-        lv_obj_add_flag(charging_overlay_img, LV_OBJ_FLAG_HIDDEN);
-    }
-    else
-    {
-        if (lv_image_get_src(charging_overlay_img) != desired_charging_patch)
-        {
-            lv_image_set_src(charging_overlay_img, desired_charging_patch);
-        }
-        lv_obj_clear_flag(charging_overlay_img, LV_OBJ_FLAG_HIDDEN);
     }
 
     /*
@@ -1603,6 +1589,11 @@ void app_main(void)
             IO_EXPANDER_PIN_NUM_4,
             IO_EXPANDER_INPUT));
 
+    if (!koyoda_charge_composite_init())
+    {
+        ESP_LOGW(TAG, "Charge composite buffer unavailable; charge visual will stay idle");
+    }
+
     bsp_display_lock(-1);
 
     lv_obj_t *screen = lv_screen_active();
@@ -1643,16 +1634,7 @@ void app_main(void)
     lv_image_set_rotation(speaking_overlay_img, 900);
     lv_obj_add_flag(speaking_overlay_img, LV_OBJ_FLAG_HIDDEN);
 
-    charging_overlay_img = lv_image_create(screen);
-    lv_image_set_src(charging_overlay_img, &koyoda_charge_patch_taste);
-    lv_obj_set_pos(charging_overlay_img,
-                   KOYODA_CHARGE_PATCH_X,
-                   KOYODA_CHARGE_PATCH_Y);
-    lv_image_set_pivot(charging_overlay_img,
-                       233 - KOYODA_CHARGE_PATCH_X,
-                       233 - KOYODA_CHARGE_PATCH_Y);
-    lv_image_set_rotation(charging_overlay_img, 900);
-    lv_obj_add_flag(charging_overlay_img, LV_OBJ_FLAG_HIDDEN);
+    /* Charge LITE v2 has no extra LVGL object. */
 
     create_battery_page(screen);
     create_wifi_page(screen);
