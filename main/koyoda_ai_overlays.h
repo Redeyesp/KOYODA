@@ -37,20 +37,27 @@ extern const lv_image_dsc_t koyoda_charge_patch_bolt;
 extern const lv_image_dsc_t koyoda_charge_patch_glow;
 
 
-#define KOYODA_BLINK_LEFT_X 57
+#define KOYODA_BLINK_LEFT_X 65
 #define KOYODA_BLINK_LEFT_Y 121
-#define KOYODA_BLINK_LEFT_W 138
-#define KOYODA_BLINK_LEFT_H 149
+#define KOYODA_BLINK_LEFT_W 125
 
-#define KOYODA_BLINK_RIGHT_X 270
+#define KOYODA_BLINK_RIGHT_X 278
 #define KOYODA_BLINK_RIGHT_Y 121
-#define KOYODA_BLINK_RIGHT_W 139
-#define KOYODA_BLINK_RIGHT_H 149
+#define KOYODA_BLINK_RIGHT_W 124
 
-extern const lv_image_dsc_t koyoda_blink_half_left;
-extern const lv_image_dsc_t koyoda_blink_half_right;
-extern const lv_image_dsc_t koyoda_blink_closed_left;
-extern const lv_image_dsc_t koyoda_blink_closed_right;
+#define KOYODA_BLINK_TOP_H 75
+#define KOYODA_BLINK_BOTTOM_Y 196
+#define KOYODA_BLINK_BOTTOM_H 74
+
+extern const lv_image_dsc_t koyoda_blink_half_left_top;
+extern const lv_image_dsc_t koyoda_blink_half_left_bottom;
+extern const lv_image_dsc_t koyoda_blink_half_right_top;
+extern const lv_image_dsc_t koyoda_blink_half_right_bottom;
+
+extern const lv_image_dsc_t koyoda_blink_closed_left_top;
+extern const lv_image_dsc_t koyoda_blink_closed_left_bottom;
+extern const lv_image_dsc_t koyoda_blink_closed_right_top;
+extern const lv_image_dsc_t koyoda_blink_closed_right_bottom;
 
 #ifdef __cplusplus
 }

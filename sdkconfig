@@ -594,6 +594,13 @@ CONFIG_PARTITION_TABLE_MD5=y
 # end of Partition Table
 
 #
+# KOYODA Audio Streaming
+#
+CONFIG_KOYODA_STREAM_HOST="192.168.1.36"
+CONFIG_KOYODA_STREAM_PORT=7777
+# end of KOYODA Audio Streaming
+
+#
 # Compiler options
 #
 # CONFIG_COMPILER_OPTIMIZATION_DEBUG is not set

@@ -32,8 +32,10 @@ static lv_obj_t *face_img = NULL;
 static lv_obj_t *thinking_overlay_img = NULL;
 static lv_obj_t *speaking_overlay_img = NULL;
 static lv_obj_t *charging_overlay_img = NULL;
-static lv_obj_t *blink_left_overlay_img = NULL;
-static lv_obj_t *blink_right_overlay_img = NULL;
+static lv_obj_t *blink_left_top_overlay_img = NULL;
+static lv_obj_t *blink_left_bottom_overlay_img = NULL;
+static lv_obj_t *blink_right_top_overlay_img = NULL;
+static lv_obj_t *blink_right_bottom_overlay_img = NULL;
 static lv_obj_t *power_overlay = NULL;
 static lv_obj_t *battery_page = NULL;
 static lv_obj_t *battery_fill = NULL;
@@ -954,8 +956,10 @@ static void set_page_from_lvgl(koyoda_page_t page)
     if (thinking_overlay_img) lv_obj_add_flag(thinking_overlay_img, LV_OBJ_FLAG_HIDDEN);
     if (speaking_overlay_img) lv_obj_add_flag(speaking_overlay_img, LV_OBJ_FLAG_HIDDEN);
     if (charging_overlay_img) lv_obj_add_flag(charging_overlay_img, LV_OBJ_FLAG_HIDDEN);
-    if (blink_left_overlay_img) lv_obj_add_flag(blink_left_overlay_img, LV_OBJ_FLAG_HIDDEN);
-    if (blink_right_overlay_img) lv_obj_add_flag(blink_right_overlay_img, LV_OBJ_FLAG_HIDDEN);
+    if (blink_left_top_overlay_img) lv_obj_add_flag(blink_left_top_overlay_img, LV_OBJ_FLAG_HIDDEN);
+    if (blink_left_bottom_overlay_img) lv_obj_add_flag(blink_left_bottom_overlay_img, LV_OBJ_FLAG_HIDDEN);
+    if (blink_right_top_overlay_img) lv_obj_add_flag(blink_right_top_overlay_img, LV_OBJ_FLAG_HIDDEN);
+    if (blink_right_bottom_overlay_img) lv_obj_add_flag(blink_right_bottom_overlay_img, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(battery_page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(wifi_page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(volume_page, LV_OBJ_FLAG_HIDDEN);
@@ -1329,6 +1333,47 @@ static void power_button_task(void *arg)
 }
 
 /* =========================================================
+ * Overlay helper
+ * ========================================================= */
+
+/*
+ * Critical for the CO5300/SPI path:
+ * Do not clear/add LV_OBJ_FLAG_HIDDEN every 20 ms when nothing changed.
+ * Re-toggling a visible image invalidates it and forces another LCD flush.
+ */
+static void update_image_overlay(
+    lv_obj_t *obj,
+    const lv_image_dsc_t *desired_src,
+    bool face_visible)
+{
+    if (obj == NULL)
+    {
+        return;
+    }
+
+    const bool hidden = lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN);
+
+    if (!face_visible || desired_src == NULL)
+    {
+        if (!hidden)
+        {
+            lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+
+    if (lv_image_get_src(obj) != desired_src)
+    {
+        lv_image_set_src(obj, desired_src);
+    }
+
+    if (hidden)
+    {
+        lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* =========================================================
  * Charging animation helpers
  * ========================================================= */
 
@@ -1407,8 +1452,10 @@ static void face_animation_step(void)
     const lv_image_dsc_t *desired_thinking_patch = NULL;
     const lv_image_dsc_t *desired_speaking_patch = NULL;
     const lv_image_dsc_t *desired_charging_patch = NULL;
-    const lv_image_dsc_t *desired_blink_left_patch = NULL;
-    const lv_image_dsc_t *desired_blink_right_patch = NULL;
+    const lv_image_dsc_t *desired_blink_left_top_patch = NULL;
+    const lv_image_dsc_t *desired_blink_left_bottom_patch = NULL;
+    const lv_image_dsc_t *desired_blink_right_top_patch = NULL;
+    const lv_image_dsc_t *desired_blink_right_bottom_patch = NULL;
 
     if (ai_state == KOYODA_FACE_AI_THINKING)
     {
@@ -1452,16 +1499,24 @@ static void face_animation_step(void)
 
         desired_face = normal_frames[frame];
 
-        /* BLINK LITE v2: only the eye regions change. */
+        /*
+         * BLINK LITE v3:
+         * same eye-only appearance, but each eye is split into two small
+         * DMA-safe invalidation rectangles.
+         */
         if (frame == 1U)
         {
-            desired_blink_left_patch = &koyoda_blink_half_left;
-            desired_blink_right_patch = &koyoda_blink_half_right;
+            desired_blink_left_top_patch = &koyoda_blink_half_left_top;
+            desired_blink_left_bottom_patch = &koyoda_blink_half_left_bottom;
+            desired_blink_right_top_patch = &koyoda_blink_half_right_top;
+            desired_blink_right_bottom_patch = &koyoda_blink_half_right_bottom;
         }
         else if (frame == 2U)
         {
-            desired_blink_left_patch = &koyoda_blink_closed_left;
-            desired_blink_right_patch = &koyoda_blink_closed_right;
+            desired_blink_left_top_patch = &koyoda_blink_closed_left_top;
+            desired_blink_left_bottom_patch = &koyoda_blink_closed_left_bottom;
+            desired_blink_right_top_patch = &koyoda_blink_closed_right_top;
+            desired_blink_right_bottom_patch = &koyoda_blink_closed_right_bottom;
         }
 
         /*
@@ -1494,70 +1549,39 @@ static void face_animation_step(void)
         lv_image_set_src(face_img, desired_face);
     }
 
-    if (!face_visible || desired_blink_left_patch == NULL)
-    {
-        lv_obj_add_flag(blink_left_overlay_img, LV_OBJ_FLAG_HIDDEN);
-    }
-    else
-    {
-        if (lv_image_get_src(blink_left_overlay_img) != desired_blink_left_patch)
-        {
-            lv_image_set_src(blink_left_overlay_img, desired_blink_left_patch);
-        }
-        lv_obj_clear_flag(blink_left_overlay_img, LV_OBJ_FLAG_HIDDEN);
-    }
+    update_image_overlay(
+        blink_left_top_overlay_img,
+        desired_blink_left_top_patch,
+        face_visible);
+    update_image_overlay(
+        blink_left_bottom_overlay_img,
+        desired_blink_left_bottom_patch,
+        face_visible);
+    update_image_overlay(
+        blink_right_top_overlay_img,
+        desired_blink_right_top_patch,
+        face_visible);
+    update_image_overlay(
+        blink_right_bottom_overlay_img,
+        desired_blink_right_bottom_patch,
+        face_visible);
 
-    if (!face_visible || desired_blink_right_patch == NULL)
-    {
-        lv_obj_add_flag(blink_right_overlay_img, LV_OBJ_FLAG_HIDDEN);
-    }
-    else
-    {
-        if (lv_image_get_src(blink_right_overlay_img) != desired_blink_right_patch)
-        {
-            lv_image_set_src(blink_right_overlay_img, desired_blink_right_patch);
-        }
-        lv_obj_clear_flag(blink_right_overlay_img, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    if (!face_visible || desired_thinking_patch == NULL)
-    {
-        lv_obj_add_flag(thinking_overlay_img, LV_OBJ_FLAG_HIDDEN);
-    }
-    else
-    {
-        if (lv_image_get_src(thinking_overlay_img) != desired_thinking_patch)
-        {
-            lv_image_set_src(thinking_overlay_img, desired_thinking_patch);
-        }
-        lv_obj_clear_flag(thinking_overlay_img, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    if (!face_visible || desired_speaking_patch == NULL)
-    {
-        lv_obj_add_flag(speaking_overlay_img, LV_OBJ_FLAG_HIDDEN);
-    }
-    else
-    {
-        if (lv_image_get_src(speaking_overlay_img) != desired_speaking_patch)
-        {
-            lv_image_set_src(speaking_overlay_img, desired_speaking_patch);
-        }
-        lv_obj_clear_flag(speaking_overlay_img, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    if (!face_visible || desired_charging_patch == NULL)
-    {
-        lv_obj_add_flag(charging_overlay_img, LV_OBJ_FLAG_HIDDEN);
-    }
-    else
-    {
-        if (lv_image_get_src(charging_overlay_img) != desired_charging_patch)
-        {
-            lv_image_set_src(charging_overlay_img, desired_charging_patch);
-        }
-        lv_obj_clear_flag(charging_overlay_img, LV_OBJ_FLAG_HIDDEN);
-    }
+    /*
+     * Use the same no-redundant-invalidation helper for every compact
+     * overlay.  This lowers SPI flush pressure during AI and charging too.
+     */
+    update_image_overlay(
+        thinking_overlay_img,
+        desired_thinking_patch,
+        face_visible);
+    update_image_overlay(
+        speaking_overlay_img,
+        desired_speaking_patch,
+        face_visible);
+    update_image_overlay(
+        charging_overlay_img,
+        desired_charging_patch,
+        face_visible);
 
     /*
      * Wi-Fi page refresh is owned by this same UI loop.
@@ -1652,28 +1676,54 @@ void app_main(void)
     lv_image_set_rotation(face_img, 900);
     lv_obj_center(face_img);
 
-    /* Eye-only blink overlays; mouth and cheeks remain from koyoda_idle. */
-    blink_left_overlay_img = lv_image_create(screen);
-    lv_image_set_src(blink_left_overlay_img, &koyoda_blink_half_left);
-    lv_obj_set_pos(blink_left_overlay_img,
+    /*
+     * BLINK LITE v3: four small slices, each below ~20 KB.
+     * This stays under the ~31 KB largest DMA-capable block observed after
+     * audio initialization.
+     */
+    blink_left_top_overlay_img = lv_image_create(screen);
+    lv_image_set_src(blink_left_top_overlay_img, &koyoda_blink_half_left_top);
+    lv_obj_set_pos(blink_left_top_overlay_img,
                    KOYODA_BLINK_LEFT_X,
                    KOYODA_BLINK_LEFT_Y);
-    lv_image_set_pivot(blink_left_overlay_img,
+    lv_image_set_pivot(blink_left_top_overlay_img,
                        233 - KOYODA_BLINK_LEFT_X,
                        233 - KOYODA_BLINK_LEFT_Y);
-    lv_image_set_rotation(blink_left_overlay_img, 900);
-    lv_obj_add_flag(blink_left_overlay_img, LV_OBJ_FLAG_HIDDEN);
+    lv_image_set_rotation(blink_left_top_overlay_img, 900);
+    lv_obj_add_flag(blink_left_top_overlay_img, LV_OBJ_FLAG_HIDDEN);
 
-    blink_right_overlay_img = lv_image_create(screen);
-    lv_image_set_src(blink_right_overlay_img, &koyoda_blink_half_right);
-    lv_obj_set_pos(blink_right_overlay_img,
+    blink_left_bottom_overlay_img = lv_image_create(screen);
+    lv_image_set_src(blink_left_bottom_overlay_img, &koyoda_blink_half_left_bottom);
+    lv_obj_set_pos(blink_left_bottom_overlay_img,
+                   KOYODA_BLINK_LEFT_X,
+                   KOYODA_BLINK_BOTTOM_Y);
+    lv_image_set_pivot(blink_left_bottom_overlay_img,
+                       233 - KOYODA_BLINK_LEFT_X,
+                       233 - KOYODA_BLINK_BOTTOM_Y);
+    lv_image_set_rotation(blink_left_bottom_overlay_img, 900);
+    lv_obj_add_flag(blink_left_bottom_overlay_img, LV_OBJ_FLAG_HIDDEN);
+
+    blink_right_top_overlay_img = lv_image_create(screen);
+    lv_image_set_src(blink_right_top_overlay_img, &koyoda_blink_half_right_top);
+    lv_obj_set_pos(blink_right_top_overlay_img,
                    KOYODA_BLINK_RIGHT_X,
                    KOYODA_BLINK_RIGHT_Y);
-    lv_image_set_pivot(blink_right_overlay_img,
+    lv_image_set_pivot(blink_right_top_overlay_img,
                        233 - KOYODA_BLINK_RIGHT_X,
                        233 - KOYODA_BLINK_RIGHT_Y);
-    lv_image_set_rotation(blink_right_overlay_img, 900);
-    lv_obj_add_flag(blink_right_overlay_img, LV_OBJ_FLAG_HIDDEN);
+    lv_image_set_rotation(blink_right_top_overlay_img, 900);
+    lv_obj_add_flag(blink_right_top_overlay_img, LV_OBJ_FLAG_HIDDEN);
+
+    blink_right_bottom_overlay_img = lv_image_create(screen);
+    lv_image_set_src(blink_right_bottom_overlay_img, &koyoda_blink_half_right_bottom);
+    lv_obj_set_pos(blink_right_bottom_overlay_img,
+                   KOYODA_BLINK_RIGHT_X,
+                   KOYODA_BLINK_BOTTOM_Y);
+    lv_image_set_pivot(blink_right_bottom_overlay_img,
+                       233 - KOYODA_BLINK_RIGHT_X,
+                       233 - KOYODA_BLINK_BOTTOM_Y);
+    lv_image_set_rotation(blink_right_bottom_overlay_img, 900);
+    lv_obj_add_flag(blink_right_bottom_overlay_img, LV_OBJ_FLAG_HIDDEN);
 
     /*
      * Tiny AI overlays use the same global rotation pivot as the 466x466
